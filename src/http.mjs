@@ -20,7 +20,7 @@ async function readJson (request) {
   }
 }
 
-export function createApiServer ({ registry, resolver }) {
+export function createApiServer ({ registry, resolver, batchTimeoutMs = 30000 }) {
   return createServer(async (request, response) => {
     try {
       const path = new URL(request.url, 'http://localhost').pathname
@@ -53,7 +53,22 @@ export function createApiServer ({ registry, resolver }) {
         return
       }
       if (request.method === 'POST' && path === '/v1/resolve/batch') {
-        send(response, 200, resolver.resolveBatch(await readJson(request)))
+        const body = await readJson(request)
+        const controller = new AbortController()
+        let timer = null
+        if (batchTimeoutMs > 0) {
+          timer = setTimeout(() => controller.abort(), batchTimeoutMs)
+        }
+        const onClose = () => {
+          if (!response.writableEnded) controller.abort()
+        }
+        response.on('close', onClose)
+        try {
+          send(response, 200, await resolver.resolveBatch(body, { signal: controller.signal }))
+        } finally {
+          if (timer) clearTimeout(timer)
+          response.removeListener('close', onClose)
+        }
         return
       }
       throw new ApiError(404, 'route_not_found', 'Route does not exist')

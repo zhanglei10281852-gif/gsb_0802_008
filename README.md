@@ -32,9 +32,19 @@ revision, never resurrects missing releases, and never crosses boundaries).
 apply, and rollback share one graph validator and impact calculator.
 `POST /v1/resolve` accepts the same release identity and one or more generated
 frames, resolving exact matches first and then walking the declared lineage to
-the nearest ancestor. `POST /v1/resolve/batch` resolves many requests against
-one immutable snapshot, returning per-item results in input order and isolating
-failures to their index. `GET /health` supports process checks.
+the nearest ancestor. `POST /v1/resolve/batch` resolves many requests against one immutable snapshot,
+returning per-item results in input order and isolating failures to their index.
+Batch execution caps in-flight work at a configurable concurrency limit
+(`BATCH_CONCURRENCY`, default 8), merges identical requests within the same
+snapshot so their read work runs once while every index still receives its own
+result, and honours an `AbortSignal` for cancellation. The HTTP server aborts a
+batch when the client disconnects or when `BATCH_TIMEOUT_MS` (default 30000)
+elapses; after cancellation no new work starts, in-flight slots are released,
+and unprocessed items are returned with `error.code = "cancelled"`. The captured
+snapshot is fixed for the whole batch, so a concurrent lineage preview, apply,
+or rollback never mixes old and new lineage within the same response, while
+subsequent requests immediately read the new revision. `GET /health` supports
+process checks.
 
 The project intentionally uses Node.js built-ins only. `BundleRegistry` owns
 copy-on-write registry state, `RegistrySnapshot` owns detached read views,

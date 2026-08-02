@@ -17,10 +17,10 @@ function populatedRegistry () {
   return registry
 }
 
-test('resolves a batch against a single immutable snapshot in input order', () => {
+test('resolves a batch against a single immutable snapshot in input order', async () => {
   const registry = populatedRegistry()
   const resolver = new SymbolResolver(registry)
-  const result = resolver.resolveBatch(batchRequest({
+  const result = await resolver.resolveBatch(batchRequest({
     requests: [
       resolveRequest({ version: '2026.08.2', frames: [{ file: 'app.js', line: 10, column: 2 }] }),
       resolveRequest({ version: '2026.08.2', frames: [{ file: 'new.js', line: 1, column: 0 }] })
@@ -37,10 +37,10 @@ test('resolves a batch against a single immutable snapshot in input order', () =
   assert.equal(result.results[1].frames[0].status, 'exact')
 })
 
-test('isolates per-item failures without dropping sibling results', () => {
+test('isolates per-item failures without dropping sibling results', async () => {
   const registry = populatedRegistry()
   const resolver = new SymbolResolver(registry)
-  const result = resolver.resolveBatch(batchRequest({
+  const result = await resolver.resolveBatch(batchRequest({
     requests: [
       resolveRequest({ version: '2026.08.2' }),
       resolveRequest({ version: '9.9.9' }),
@@ -59,10 +59,10 @@ test('isolates per-item failures without dropping sibling results', () => {
   assert.equal(result.results[3].frames[0].status, 'exact')
 })
 
-test('shares one snapshot across the whole batch so later items cannot see newer revisions', () => {
+test('shares one snapshot across the whole batch so later items cannot see newer revisions', async () => {
   const registry = populatedRegistry()
   const resolver = new SymbolResolver(registry)
-  const result = resolver.resolveBatch(batchRequest({
+  const result = await resolver.resolveBatch(batchRequest({
     requests: [
       resolveRequest({ version: '2026.08.2' }),
       resolveRequest({ version: '2026.08.99' })
@@ -74,19 +74,19 @@ test('shares one snapshot across the whole batch so later items cannot see newer
   assert.equal(result.results[1].error.code, 'bundle_not_found')
 })
 
-test('rejects a batch payload without a requests array', () => {
+test('rejects a batch payload without a requests array', async () => {
   const registry = populatedRegistry()
   const resolver = new SymbolResolver(registry)
-  assert.throws(
+  await assert.rejects(
     () => resolver.resolveBatch({}),
     (error) => error.code === 'invalid_requests'
   )
 })
 
-test('localizes non-object batch items to their index', () => {
+test('localizes non-object batch items to their index', async () => {
   const registry = populatedRegistry()
   const resolver = new SymbolResolver(registry)
-  const result = resolver.resolveBatch({ requests: [null, resolveRequest({ version: '2026.08.1' })] })
+  const result = await resolver.resolveBatch({ requests: [null, resolveRequest({ version: '2026.08.1' })] })
   assert.equal(result.results[0].ok, false)
   assert.equal(result.results[0].error.code, 'invalid_request')
   assert.equal(result.results[1].ok, true)
