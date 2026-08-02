@@ -41,6 +41,17 @@ revision (never by resurrecting an old one), so inverse changes pass through
 the identical unknown-version, cross-boundary, and cycle checks. Every
 committed batch is kept in a bounded history (last 50) for rollback targeting.
 
+Batch resolution runs under production execution controls: at most
+`batchConcurrency` resolution units are in flight at once (default 4, with a
+cooperative yield between units), and identical requests inside one batch are
+resolved once against the batch's single immutable snapshot and then fanned
+out in input order — duplicates still get their own located entries, and reuse
+never crosses a registry revision. Cancelling the request, a client
+disconnect, or the optional `BATCH_TIMEOUT_MS` deadline aborts the batch with
+`batch_aborted` (408): no new resolution work starts afterwards and the
+batch's read state is dropped immediately. A slow batch always finishes on
+the snapshot it started with, even if lineage changes commit around it.
+
 The project intentionally uses Node.js built-ins only. `BundleRegistry` owns
 copy-on-write registry state, `RegistrySnapshot` owns detached read views,
 `SymbolResolver` owns request projection, and `ResolutionCache` only serves

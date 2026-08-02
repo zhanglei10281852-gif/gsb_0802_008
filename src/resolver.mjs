@@ -41,10 +41,40 @@ function resolveFrame(snapshot, bundle, identity, frame) {
   };
 }
 
+const defaultSchedule = () => new Promise((resolve) => setImmediate(resolve));
+
+function abortedError() {
+  return new ApiError(408, "batch_aborted", "Batch resolution was aborted");
+}
+
 export class SymbolResolver {
-  constructor(registry, { cache = null } = {}) {
+  constructor(
+    registry,
+    { cache = null, batchConcurrency = 4, schedule = defaultSchedule } = {},
+  ) {
     this.registry = registry;
     this.cache = cache;
+    this.batchConcurrency = Math.max(1, batchConcurrency);
+    this.schedule = schedule;
+  }
+
+  async #waitTurn(signal) {
+    if (signal?.aborted) throw abortedError();
+    await new Promise((resolve, reject) => {
+      const onAbort = () => reject(abortedError());
+      signal?.addEventListener("abort", onAbort, { once: true });
+      Promise.resolve(this.schedule()).then(
+        () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        },
+      );
+    });
+    if (signal?.aborted) throw abortedError();
   }
 
   resolve(body) {
@@ -78,24 +108,65 @@ export class SymbolResolver {
     };
   }
 
-  resolveBatch(body) {
+  async resolveBatch(body, { signal = null } = {}) {
     const requests = readBatchRequests(body);
     const snapshot = this.registry.snapshot();
-    return {
-      registryRevision: snapshot.revision,
-      results: requests.map((item, index) => {
+    const results = new Array(requests.length);
+    const groups = new Map();
+    requests.forEach((item, index) => {
+      let parsed;
+      try {
+        parsed = {
+          identity: readIdentity(item),
+          frames: readFrames(item.frames),
+        };
+      } catch (error) {
+        const known = toApiError(error);
+        results[index] = { index, error: known.code, message: known.message };
+        return;
+      }
+      const key = JSON.stringify(parsed);
+      const group = groups.get(key);
+      if (group) group.indices.push(index);
+      else groups.set(key, { ...parsed, indices: [index] });
+    });
+    const queue = [...groups.values()];
+    const worker = async () => {
+      while (queue.length > 0) {
+        if (signal?.aborted) throw abortedError();
+        const group = queue.shift();
+        await this.#waitTurn(signal);
         try {
-          const identity = readIdentity(item);
-          const frames = readFrames(item.frames);
-          return {
-            index,
-            ...this.resolveSnapshot({ identity, frames, snapshot }),
-          };
+          group.result = this.resolveSnapshot({
+            identity: group.identity,
+            frames: group.frames,
+            snapshot,
+          });
         } catch (error) {
           const known = toApiError(error);
-          return { index, error: known.code, message: known.message };
+          group.error = { code: known.code, message: known.message };
         }
-      }),
+      }
     };
+    try {
+      await Promise.all(
+        Array.from(
+          { length: Math.min(this.batchConcurrency, queue.length) },
+          worker,
+        ),
+      );
+    } catch (error) {
+      queue.length = 0;
+      groups.clear();
+      throw error;
+    }
+    for (const group of groups.values()) {
+      for (const index of group.indices) {
+        results[index] = group.error
+          ? { index, error: group.error.code, message: group.error.message }
+          : { index, ...copy(group.result) };
+      }
+    }
+    return { registryRevision: snapshot.revision, results };
   }
 }

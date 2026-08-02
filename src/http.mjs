@@ -2,6 +2,7 @@ import { createServer } from 'node:http'
 import { toApiError, ApiError } from './errors.mjs'
 
 function send (response, statusCode, body) {
+  if (response.destroyed || response.writableEnded) return
   response.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' })
   response.end(JSON.stringify(body))
 }
@@ -20,7 +21,7 @@ async function readJson (request) {
   }
 }
 
-export function createApiServer ({ registry, resolver }) {
+export function createApiServer ({ registry, resolver, batchTimeoutMs = 0 }) {
   return createServer(async (request, response) => {
     try {
       const path = new URL(request.url, 'http://localhost').pathname
@@ -49,7 +50,19 @@ export function createApiServer ({ registry, resolver }) {
         return
       }
       if (request.method === 'POST' && path === '/v1/resolve/batch') {
-        send(response, 200, resolver.resolveBatch(await readJson(request)))
+        const controller = new AbortController()
+        const timer = batchTimeoutMs > 0
+          ? setTimeout(() => controller.abort(), batchTimeoutMs)
+          : null
+        response.on('close', () => {
+          if (!response.writableEnded) controller.abort()
+        })
+        try {
+          const body = await readJson(request)
+          send(response, 200, await resolver.resolveBatch(body, { signal: controller.signal }))
+        } finally {
+          if (timer) clearTimeout(timer)
+        }
         return
       }
       throw new ApiError(404, 'route_not_found', 'Route does not exist')

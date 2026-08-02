@@ -185,9 +185,9 @@ test('keeps lineage scoped per application and platform', () => {
   assert.equal(registry.snapshot().getParent({ application: 'mobile-shell', platform: 'ios', version: '2026.08.1' }), null)
 })
 
-test('serves one immutable snapshot across a batch and locates per-item failures', () => {
+test('serves one immutable snapshot across a batch and locates per-item failures', async () => {
   const registry = setupLineage()
-  const result = new SymbolResolver(registry).resolveBatch({
+  const result = await new SymbolResolver(registry).resolveBatch({
     requests: [
       resolveRequest({ version: '2026.08.2', frames: [{ file: 'app.js', line: 10, column: 2 }] }),
       { application: 'mobile-shell', platform: 'ios', version: '2026.08.2', frames: 'nope' },
@@ -207,15 +207,15 @@ test('serves one immutable snapshot across a batch and locates per-item failures
   assert.equal(result.results[3].frames[0].resolvedFrom, '2026.08.1')
 })
 
-test('rejects an invalid batch envelope', () => {
+test('rejects an invalid batch envelope', async () => {
   const registry = setupLineage()
   const resolver = new SymbolResolver(registry)
-  assert.throws(
-    () => resolver.resolveBatch({ requests: [] }),
+  await assert.rejects(
+    resolver.resolveBatch({ requests: [] }),
     (error) => error instanceof ApiError && error.code === 'invalid_requests'
   )
-  assert.throws(
-    () => resolver.resolveBatch(null),
+  await assert.rejects(
+    resolver.resolveBatch(null),
     (error) => error instanceof ApiError && error.code === 'invalid_payload'
   )
 })

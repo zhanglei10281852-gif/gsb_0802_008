@@ -268,10 +268,7 @@ test("previews lineage changes over HTTP without mutating state", async (t) => {
 
   const rejected = await post(baseUrl, "/v1/lineage/preview", {
     revision: 2,
-    changes: [
-      lineageChange(),
-      lineageChange({ version: "2026.09.9" }),
-    ],
+    changes: [lineageChange(), lineageChange({ version: "2026.09.9" })],
   });
   assert.equal(rejected.status, 200);
   const rejectedReport = await rejected.json();
@@ -346,4 +343,100 @@ test("rolls back lineage over HTTP as a new validated revision", async (t) => {
   const body = await resolved.json();
   assert.equal(body.registryRevision, 4);
   assert.equal(body.frames[0].status, "unmapped");
+});
+
+test("stops batch work promptly when the client disconnects", async (t) => {
+  const pending = [];
+  const schedule = () => new Promise((resolve) => pending.push(resolve));
+  const registry = new BundleRegistry();
+  const resolver = new SymbolResolver(registry, { schedule });
+  let starts = 0;
+  const originalSnapshot = resolver.resolveSnapshot.bind(resolver);
+  resolver.resolveSnapshot = (...args) => {
+    starts += 1;
+    return originalSnapshot(...args);
+  };
+  let serverBatch;
+  const originalBatch = resolver.resolveBatch.bind(resolver);
+  resolver.resolveBatch = (...args) => {
+    serverBatch = originalBatch(...args);
+    return serverBatch;
+  };
+  const server = createApiServer({ registry, resolver });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await post(baseUrl, "/v1/bundles", bundle());
+  await post(baseUrl, "/v1/bundles", childBundle());
+
+  const client = new AbortController();
+  const clientFetch = fetch(`${baseUrl}/v1/resolve/batch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      requests: [
+        resolveRequest({ frames: [{ file: "app.js", line: 10, column: 2 }] }),
+        resolveRequest({
+          version: "2026.08.2",
+          frames: [{ file: "app.js", line: 10, column: 2 }],
+        }),
+        resolveRequest({
+          frames: [{ file: "checkout.js", line: 19, column: 0 }],
+        }),
+      ],
+    }),
+    signal: client.signal,
+  });
+  clientFetch.catch(() => {});
+  for (let step = 0; step < 100 && pending.length === 0; step += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(pending.length > 0);
+
+  client.abort();
+  await assert.rejects(
+    serverBatch,
+    (error) => error.statusCode === 408 && error.code === "batch_aborted",
+  );
+  assert.equal(starts, 0);
+  while (pending.length > 0) pending.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(starts, 0);
+
+  const health = await fetch(`${baseUrl}/health`);
+  assert.equal(health.status, 200);
+  const afterPromise = post(baseUrl, "/v1/resolve/batch", {
+    requests: [resolveRequest()],
+  });
+  let settled = false;
+  afterPromise.finally(() => {
+    settled = true;
+  });
+  while (!settled) {
+    while (pending.length > 0) pending.shift()();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const after = await afterPromise;
+  assert.equal(after.status, 200);
+  assert.equal((await after.json()).results[0].frames[0].status, "exact");
+});
+
+test("answers 408 when a stalled batch exceeds the server timeout", async (t) => {
+  const pending = [];
+  const schedule = () => new Promise((resolve) => pending.push(resolve));
+  const registry = new BundleRegistry();
+  const resolver = new SymbolResolver(registry, { schedule });
+  const server = createApiServer({ registry, resolver, batchTimeoutMs: 30 });
+  const baseUrl = await listen(server);
+  t.after(() => {
+    while (pending.length > 0) pending.shift()();
+    server.close();
+  });
+
+  await post(baseUrl, "/v1/bundles", bundle());
+  const response = await post(baseUrl, "/v1/resolve/batch", {
+    requests: [resolveRequest()],
+  });
+  assert.equal(response.status, 408);
+  assert.equal((await response.json()).error, "batch_aborted");
 });
