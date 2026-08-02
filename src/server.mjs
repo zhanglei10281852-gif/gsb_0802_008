@@ -1,11 +1,7 @@
-import { BundleRegistry } from './bundle-registry.mjs'
 import { createApiServer } from './http.mjs'
-import { ResolutionCache } from './resolution-cache.mjs'
-import { SymbolResolver } from './resolver.mjs'
+import { createServices } from './services.mjs'
 
-const registry = new BundleRegistry()
-const cache = new ResolutionCache()
-const resolver = new SymbolResolver(registry, { cache })
+const { registry, resolver } = createServices()
 const port = Number(process.env.PORT ?? 3000)
 const host = process.env.HOST ?? '127.0.0.1'
 const server = createApiServer({ registry, resolver })

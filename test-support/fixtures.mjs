@@ -27,6 +27,42 @@ export function resolveRequest (overrides = {}) {
   }
 }
 
+export function lineageRequest (overrides = {}) {
+  return {
+    application: 'mobile-shell',
+    platform: 'android',
+    expectedRevision: 0,
+    relations: [{ version: '2026.08.2', parent: '2026.08.1' }],
+    ...overrides
+  }
+}
+
+export function rollbackRequest (overrides = {}) {
+  return {
+    application: 'mobile-shell',
+    platform: 'android',
+    expectedRevision: 0,
+    toRevision: 0,
+    ...overrides
+  }
+}
+
+export function reclaimRequest (overrides = {}) {
+  return {
+    application: 'mobile-shell',
+    platform: 'android',
+    versions: ['2026.08.2'],
+    ...overrides
+  }
+}
+
+export function batchRequest (overrides = {}) {
+  return {
+    items: [resolveRequest()],
+    ...overrides
+  }
+}
+
 export async function listen (server) {
   await new Promise((resolve, reject) => {
     server.once('error', reject)
