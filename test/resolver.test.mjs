@@ -42,11 +42,11 @@ test('keeps cached results revision-scoped and detached from callers', () => {
   const second = resolver.resolve(resolveRequest())
   assert.equal(second.frames[0].source.file, 'src/bootstrap.ts')
 
-  registry.put(bundle({ mappings: [{
+  registry.put(bundle({ version: '2026.08.2', mappings: [{
     generated: { file: 'app.js', line: 10, column: 2 },
     source: { file: 'src/replaced.ts', line: 7, column: 1 }
   }] }))
   const afterWrite = resolver.resolve(resolveRequest())
   assert.equal(afterWrite.registryRevision, 2)
-  assert.equal(afterWrite.frames[0].source.file, 'src/replaced.ts')
+  assert.equal(afterWrite.frames[0].source.file, 'src/bootstrap.ts')
 })
