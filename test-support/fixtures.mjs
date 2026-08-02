@@ -27,6 +27,23 @@ export function resolveRequest (overrides = {}) {
   }
 }
 
+export function lineageRequest (overrides = {}) {
+  return {
+    expectedRevision: 0,
+    relationships: [
+      { application: 'mobile-shell', platform: 'android', version: '2026.08.2', parentVersion: '2026.08.1' }
+    ],
+    ...overrides
+  }
+}
+
+export function batchRequest (overrides = {}) {
+  return {
+    requests: [resolveRequest()],
+    ...overrides
+  }
+}
+
 export async function listen (server) {
   await new Promise((resolve, reject) => {
     server.once('error', reject)

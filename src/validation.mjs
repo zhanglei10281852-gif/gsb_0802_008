@@ -26,6 +26,87 @@ export function bundleKey (identity) {
   return `${identity.application}\u0000${identity.platform}\u0000${identity.version}`
 }
 
+export function parseBundleKey (key) {
+  const sep = key.indexOf('\u0000')
+  const second = key.indexOf('\u0000', sep + 1)
+  return {
+    application: key.slice(0, sep),
+    platform: key.slice(sep + 1, second),
+    version: key.slice(second + 1)
+  }
+}
+
+export function readOptionalParentVersion (value) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new ApiError(400, 'invalid_parent_version', 'parentVersion must be a non-empty string or null')
+  }
+  return value.trim()
+}
+
+export function readLineageBody (value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ApiError(400, 'invalid_payload', 'Request body must be an object')
+  }
+  if (!Number.isInteger(value.expectedRevision) || value.expectedRevision < 0) {
+    throw new ApiError(400, 'invalid_expected_revision', 'expectedRevision must be a non-negative integer')
+  }
+  if (!Array.isArray(value.relationships) || value.relationships.length === 0 || value.relationships.length > 100) {
+    throw new ApiError(400, 'invalid_relationships', 'relationships must contain between 1 and 100 items')
+  }
+  const seen = new Set()
+  const relationships = value.relationships.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new ApiError(400, 'invalid_relationship', 'every relationship must be an object')
+    }
+    const identity = readIdentity(item)
+    if (item.parentVersion !== undefined && item.parentVersion !== null) {
+      if (typeof item.parentVersion !== 'string' || item.parentVersion.trim().length === 0) {
+        throw new ApiError(400, 'invalid_parent_version', 'parentVersion must be a non-empty string or null')
+      }
+    }
+    const parentVersion = item.parentVersion === undefined || item.parentVersion === null
+      ? null
+      : item.parentVersion.trim()
+    const childKey = bundleKey(identity)
+    if (seen.has(childKey)) {
+      throw new ApiError(400, 'duplicate_relationship', 'each release may only appear once in a lineage batch')
+    }
+    seen.add(childKey)
+    if (parentVersion !== null && parentVersion === identity.version) {
+      throw new ApiError(400, 'invalid_relationship', 'a release cannot be its own parent')
+    }
+    return { identity, parentVersion }
+  })
+  return { expectedRevision: value.expectedRevision, relationships }
+}
+
+export function readBatchBody (value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ApiError(400, 'invalid_payload', 'Request body must be an object')
+  }
+  if (!Array.isArray(value.requests) || value.requests.length === 0 || value.requests.length > 50) {
+    throw new ApiError(400, 'invalid_requests', 'requests must contain between 1 and 50 items')
+  }
+  return value.requests
+}
+
+export function readRollbackBody (value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ApiError(400, 'invalid_payload', 'Request body must be an object')
+  }
+  if (!Number.isInteger(value.expectedRevision) || value.expectedRevision < 0) {
+    throw new ApiError(400, 'invalid_expected_revision', 'expectedRevision must be a non-negative integer')
+  }
+  if (!Number.isInteger(value.targetRevision) || value.targetRevision < 0) {
+    throw new ApiError(400, 'invalid_target_revision', 'targetRevision must be a non-negative integer')
+  }
+  if (value.targetRevision > value.expectedRevision) {
+    throw new ApiError(400, 'invalid_target_revision', 'targetRevision cannot be newer than expectedRevision')
+  }
+  return { expectedRevision: value.expectedRevision, targetRevision: value.targetRevision }
+}
+
 export function readMappings (value) {
   if (!Array.isArray(value) || value.length === 0) {
     throw new ApiError(400, 'invalid_mappings', 'mappings must be a non-empty array')
