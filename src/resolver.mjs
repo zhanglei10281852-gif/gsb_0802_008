@@ -92,10 +92,14 @@ function readConcurrency(value) {
 }
 
 export class SymbolResolver {
-  constructor(registry, { cache = null, executeWork = null } = {}) {
+  constructor(
+    registry,
+    { cache = null, executeWork = null, leaseManager = null } = {},
+  ) {
     this.registry = registry;
     this.cache = cache;
     this.executeWork = executeWork;
+    this.leaseManager = leaseManager;
   }
 
   resolve(body) {
@@ -131,6 +135,10 @@ export class SymbolResolver {
     const semaphore = new Semaphore(concurrency);
     const inflight = new Map();
 
+    const releaseLease = this.leaseManager
+      ? this.leaseManager.acquire([...snapshot.artifacts.keys()])
+      : null;
+
     try {
       const results = await Promise.all(
         items.map((item) =>
@@ -140,6 +148,7 @@ export class SymbolResolver {
       return { registryRevision: snapshot.revision, results };
     } finally {
       inflight.clear();
+      if (releaseLease) releaseLease();
     }
   }
 

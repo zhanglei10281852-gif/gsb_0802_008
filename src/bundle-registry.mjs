@@ -39,6 +39,7 @@ function errorToApiError(error) {
   const statusByCode = {
     revision_conflict: 409,
     revision_not_in_history: 409,
+    gc_revision_conflict: 409,
     unknown_release: 404,
     unknown_parent_release: 404,
     invalid_parent_version: 400,
@@ -60,10 +61,12 @@ export class BundleRegistry {
   };
   #history = [];
   #historyLimit;
+  #leaseManager;
 
-  constructor({ historyLimit = 50 } = {}) {
+  constructor({ historyLimit = 50, leaseManager = null } = {}) {
     this.#historyLimit = historyLimit;
-    this.#history.push({ revision: 0, lineage: new Map() });
+    this.#leaseManager = leaseManager;
+    this.#history.push({ revision: 0, lineage: new Map(), digests: new Set() });
   }
 
   put(body) {
@@ -136,8 +139,92 @@ export class BundleRegistry {
   }
 
   #recordHistory(revision, lineage) {
-    this.#history.push({ revision, lineage: new Map(lineage) });
+    const digests = new Set();
+    for (const bundle of this.#state.bundles.values())
+      digests.add(bundle.digest);
+    this.#history.push({ revision, lineage: new Map(lineage), digests });
     while (this.#history.length > this.#historyLimit) this.#history.shift();
+  }
+
+  #liveDigestSets() {
+    const byCurrent = new Set();
+    for (const bundle of this.#state.bundles.values())
+      byCurrent.add(bundle.digest);
+    const byHistory = new Set();
+    for (const entry of this.#history) {
+      for (const digest of entry.digests) byHistory.add(digest);
+    }
+    const byLeases = this.#leaseManager
+      ? this.#leaseManager.liveDigests
+      : new Set();
+    return { byCurrent, byHistory, byLeases };
+  }
+
+  #computeReclaimable() {
+    const { byCurrent, byHistory, byLeases } = this.#liveDigestSets();
+    const protectedSet = new Set([...byCurrent, ...byHistory, ...byLeases]);
+    const reclaimable = [];
+    for (const digest of this.#state.artifacts.keys()) {
+      if (!protectedSet.has(digest)) {
+        const artifact = this.#state.artifacts.get(digest);
+        reclaimable.push({ digest, mappingCount: artifact.mappings.length });
+      }
+    }
+    return {
+      reclaimable,
+      retained: {
+        currentReleaseDigestCount: byCurrent.size,
+        historyWindowDigestCount: byHistory.size,
+        activeLeaseDigestCount: byLeases.size,
+        activeBatchCount: this.#leaseManager
+          ? this.#leaseManager.activeCount
+          : 0,
+      },
+    };
+  }
+
+  previewGc() {
+    const { reclaimable, retained } = this.#computeReclaimable();
+    return {
+      currentRevision: this.#state.revision,
+      reclaimable,
+      retained,
+    };
+  }
+
+  reclaimArtifacts(body = {}) {
+    const expectedRevision = readExpectedRevision(body.expectedRevision);
+    const previous = this.#state;
+    if (expectedRevision !== null && expectedRevision !== previous.revision) {
+      throw new ApiError(
+        409,
+        "gc_revision_conflict",
+        `Registry is at revision ${previous.revision}, expected ${expectedRevision}`,
+      );
+    }
+    const preview = this.previewGc();
+    if (preview.reclaimable.length === 0) {
+      return {
+        revision: previous.revision,
+        previousRevision: previous.revision,
+        reclaimed: 0,
+        reclaimedDigests: [],
+      };
+    }
+    const artifacts = new Map(previous.artifacts);
+    const reclaimedDigests = [];
+    for (const { digest } of preview.reclaimable) {
+      artifacts.delete(digest);
+      reclaimedDigests.push(digest);
+    }
+    const nextRevision = previous.revision + 1;
+    this.#state = { ...previous, revision: nextRevision, artifacts };
+    return {
+      revision: nextRevision,
+      previousRevision: previous.revision,
+      reclaimed: reclaimedDigests.length,
+      reclaimedDigests,
+    };
   }
 
   previewLineage(body) {
