@@ -32,8 +32,16 @@ export function createApiServer ({ registry, resolver }) {
         send(response, 201, registry.put(await readJson(request)))
         return
       }
+      if (request.method === 'POST' && path === '/v1/lineage') {
+        send(response, 200, registry.adjustLineage(await readJson(request)))
+        return
+      }
       if (request.method === 'POST' && path === '/v1/resolve') {
         send(response, 200, resolver.resolve(await readJson(request)))
+        return
+      }
+      if (request.method === 'POST' && path === '/v1/resolve/batch') {
+        send(response, 200, resolver.resolveBatch(await readJson(request)))
         return
       }
       throw new ApiError(404, 'route_not_found', 'Route does not exist')
