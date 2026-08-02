@@ -7,6 +7,7 @@ import {
   readIdentity,
   readLineageRequest,
   readMappings,
+  readRollbackRequest,
 } from "./validation.mjs";
 
 const copy = (value) => structuredClone(value);
@@ -32,22 +33,29 @@ function toArtifact(mappings, digest) {
   };
 }
 
-function assertAcyclic(startKey, lineage) {
+function findCycle(startKey, lineage) {
   const visited = new Set([startKey]);
   let cursor = lineage.get(startKey);
   while (cursor) {
     const key = bundleKey(cursor);
-    if (visited.has(key)) {
-      throw new ApiError(
-        400,
-        "lineage_cycle",
-        "Lineage changes would create a cycle",
-      );
-    }
+    if (visited.has(key)) return true;
     visited.add(key);
     cursor = lineage.get(key);
   }
+  return false;
 }
+
+function ancestorChain(startKey, lineage) {
+  const chain = [];
+  let cursor = lineage.get(startKey);
+  while (cursor) {
+    chain.push(cursor);
+    cursor = lineage.get(bundleKey(cursor));
+  }
+  return chain;
+}
+
+const HISTORY_LIMIT = 50;
 
 export class BundleRegistry {
   #state = {
@@ -56,6 +64,7 @@ export class BundleRegistry {
     artifacts: new Map(),
     lineage: new Map(),
   };
+  #history = [];
 
   put(body) {
     const identity = readIdentity(body);
@@ -90,66 +99,160 @@ export class BundleRegistry {
     };
   }
 
-  applyLineage(body) {
-    const { revision, changes } = readLineageRequest(body);
+  #planLineage(changes) {
     const previous = this.#state;
-    if (revision !== previous.revision) {
+    const lineage = new Map(previous.lineage);
+    const touched = new Set();
+    const violations = [];
+    const effects = [];
+    changes.forEach((change, index) => {
+      const key = bundleKey(change);
+      if (touched.has(key)) {
+        violations.push({
+          code: "duplicate_relation",
+          message: "The same release appears in multiple changes",
+          changeIndex: index,
+        });
+        return;
+      }
+      touched.add(key);
+      if (!previous.bundles.has(key)) {
+        violations.push({
+          code: "unknown_version",
+          message: `No bundle exists for release ${change.version}`,
+          changeIndex: index,
+        });
+        return;
+      }
+      if (change.parent !== null) {
+        if (
+          change.parent.application !== change.application ||
+          change.parent.platform !== change.platform
+        ) {
+          violations.push({
+            code: "cross_boundary_reference",
+            message: "Parent must belong to the same application and platform",
+            changeIndex: index,
+          });
+          return;
+        }
+        if (!previous.bundles.has(bundleKey(change.parent))) {
+          violations.push({
+            code: "unknown_version",
+            message: `No bundle exists for parent release ${change.parent.version}`,
+            changeIndex: index,
+          });
+          return;
+        }
+      }
+      effects.push({
+        application: change.application,
+        platform: change.platform,
+        version: change.version,
+        from: copy(previous.lineage.get(key) ?? null),
+        to: copy(change.parent),
+      });
+      if (change.parent === null) lineage.delete(key);
+      else lineage.set(key, copy(change.parent));
+    });
+    if (violations.length === 0) {
+      for (const key of touched) {
+        if (findCycle(key, lineage)) {
+          violations.push({
+            code: "lineage_cycle",
+            message: "Lineage changes would create a cycle",
+            changeIndex: null,
+          });
+          break;
+        }
+      }
+    }
+    return { previous, lineage, violations, effects };
+  }
+
+  #lineageImpact(previous, lineage, effects) {
+    const affectedReleases = [];
+    for (const [key, descriptor] of previous.bundles) {
+      const before = ancestorChain(key, previous.lineage);
+      const after = ancestorChain(key, lineage);
+      if (JSON.stringify(before) !== JSON.stringify(after)) {
+        affectedReleases.push(copy(descriptor.identity));
+      }
+    }
+    affectedReleases.sort((a, b) => bundleKey(a).localeCompare(bundleKey(b)));
+    return { changes: effects, affectedReleases };
+  }
+
+  #commitLineage({ revision, changes }) {
+    if (revision !== this.#state.revision) {
       throw new ApiError(
         409,
         "revision_conflict",
         "Registry revision has changed; reload and retry",
       );
     }
-    const lineage = new Map(previous.lineage);
-    const touched = new Set();
-    for (const change of changes) {
-      const key = bundleKey(change);
-      if (touched.has(key)) {
-        throw new ApiError(
-          400,
-          "duplicate_relation",
-          "The same release appears in multiple changes",
-        );
-      }
-      touched.add(key);
-      if (!previous.bundles.has(key)) {
-        throw new ApiError(
-          400,
-          "unknown_version",
-          `No bundle exists for release ${change.version}`,
-        );
-      }
-      if (change.parent === null) {
-        lineage.delete(key);
-        continue;
-      }
-      if (
-        change.parent.application !== change.application ||
-        change.parent.platform !== change.platform
-      ) {
-        throw new ApiError(
-          400,
-          "cross_boundary_reference",
-          "Parent must belong to the same application and platform",
-        );
-      }
-      if (!previous.bundles.has(bundleKey(change.parent))) {
-        throw new ApiError(
-          400,
-          "unknown_version",
-          `No bundle exists for parent release ${change.parent.version}`,
-        );
-      }
-      lineage.set(key, copy(change.parent));
+    const plan = this.#planLineage(changes);
+    if (plan.violations.length > 0) {
+      const first = plan.violations[0];
+      throw new ApiError(400, first.code, first.message);
     }
-    for (const key of touched) assertAcyclic(key, lineage);
+    const nextRevision = plan.previous.revision + 1;
     this.#state = {
-      revision: previous.revision + 1,
-      bundles: previous.bundles,
-      artifacts: previous.artifacts,
-      lineage,
+      revision: nextRevision,
+      bundles: plan.previous.bundles,
+      artifacts: plan.previous.artifacts,
+      lineage: plan.lineage,
     };
-    return { revision: previous.revision + 1, applied: changes.length };
+    this.#history.push({
+      revision: nextRevision,
+      changes: copy(plan.effects),
+      committedAt: new Date().toISOString(),
+    });
+    if (this.#history.length > HISTORY_LIMIT) {
+      this.#history.splice(0, this.#history.length - HISTORY_LIMIT);
+    }
+    return { revision: nextRevision, applied: changes.length };
+  }
+
+  applyLineage(body) {
+    const { revision, changes } = readLineageRequest(body);
+    return this.#commitLineage({ revision, changes });
+  }
+
+  previewLineage(body) {
+    const { revision, changes } = readLineageRequest(body);
+    const plan = this.#planLineage(changes);
+    const valid = plan.violations.length === 0;
+    return {
+      revision: this.#state.revision,
+      baseRevision: revision,
+      stale: revision !== this.#state.revision,
+      valid,
+      violations: plan.violations,
+      impact: valid
+        ? this.#lineageImpact(plan.previous, plan.lineage, plan.effects)
+        : null,
+    };
+  }
+
+  rollbackLineage(body) {
+    const { revision, target } = readRollbackRequest(body);
+    const entry = this.#history.find((record) => record.revision === target);
+    if (!entry) {
+      throw new ApiError(
+        404,
+        "revision_not_found",
+        "No lineage change recorded at this revision",
+      );
+    }
+    const inverse = entry.changes.map((change) => ({
+      application: change.application,
+      platform: change.platform,
+      version: change.version,
+      parent: change.from ? copy(change.from) : null,
+    }));
+    const committed = this.#commitLineage({ revision, changes: inverse });
+    return { ...committed, revertedFrom: target };
   }
 
   snapshot() {

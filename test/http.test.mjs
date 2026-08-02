@@ -233,3 +233,117 @@ test("serves batch diagnostics with ordered results and located per-item errors"
   assert.equal(empty.status, 400);
   assert.equal((await empty.json()).error, "invalid_requests");
 });
+
+test("previews lineage changes over HTTP without mutating state", async (t) => {
+  const registry = new BundleRegistry();
+  const server = createApiServer({
+    registry,
+    resolver: new SymbolResolver(registry),
+  });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await post(baseUrl, "/v1/bundles", bundle());
+  await post(baseUrl, "/v1/bundles", childBundle());
+
+  const preview = await post(baseUrl, "/v1/lineage/preview", {
+    revision: 2,
+    changes: [lineageChange()],
+  });
+  assert.equal(preview.status, 200);
+  const report = await preview.json();
+  assert.equal(report.revision, 2);
+  assert.equal(report.stale, false);
+  assert.equal(report.valid, true);
+  assert.deepEqual(report.violations, []);
+  assert.deepEqual(report.impact.changes[0].from, null);
+  assert.deepEqual(report.impact.changes[0].to, {
+    application: "mobile-shell",
+    platform: "android",
+    version: "2026.08.1",
+  });
+  assert.deepEqual(report.impact.affectedReleases, [
+    { application: "mobile-shell", platform: "android", version: "2026.08.2" },
+  ]);
+
+  const rejected = await post(baseUrl, "/v1/lineage/preview", {
+    revision: 2,
+    changes: [
+      lineageChange(),
+      lineageChange({ version: "2026.09.9" }),
+    ],
+  });
+  assert.equal(rejected.status, 200);
+  const rejectedReport = await rejected.json();
+  assert.equal(rejectedReport.valid, false);
+  assert.equal(rejectedReport.impact, null);
+  assert.deepEqual(
+    rejectedReport.violations.map((violation) => violation.code),
+    ["unknown_version"],
+  );
+  assert.equal(rejectedReport.violations[0].changeIndex, 1);
+
+  const resolved = await post(
+    baseUrl,
+    "/v1/resolve",
+    resolveRequest({
+      version: "2026.08.2",
+      frames: [{ file: "app.js", line: 10, column: 2 }],
+    }),
+  );
+  assert.equal((await resolved.json()).frames[0].status, "unmapped");
+});
+
+test("rolls back lineage over HTTP as a new validated revision", async (t) => {
+  const registry = new BundleRegistry();
+  const server = createApiServer({
+    registry,
+    resolver: new SymbolResolver(registry),
+  });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await post(baseUrl, "/v1/bundles", bundle());
+  await post(baseUrl, "/v1/bundles", childBundle());
+  await post(baseUrl, "/v1/lineage", {
+    revision: 2,
+    changes: [lineageChange()],
+  });
+
+  const stale = await post(baseUrl, "/v1/lineage/rollback", {
+    revision: 2,
+    target: 3,
+  });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).error, "revision_conflict");
+
+  const missing = await post(baseUrl, "/v1/lineage/rollback", {
+    revision: 3,
+    target: 42,
+  });
+  assert.equal(missing.status, 404);
+  assert.equal((await missing.json()).error, "revision_not_found");
+
+  const rolledBack = await post(baseUrl, "/v1/lineage/rollback", {
+    revision: 3,
+    target: 3,
+  });
+  assert.equal(rolledBack.status, 200);
+  assert.deepEqual(await rolledBack.json(), {
+    revision: 4,
+    applied: 1,
+    revertedFrom: 3,
+  });
+
+  const resolved = await post(
+    baseUrl,
+    "/v1/resolve",
+    resolveRequest({
+      version: "2026.08.2",
+      frames: [{ file: "app.js", line: 10, column: 2 }],
+    }),
+  );
+  const body = await resolved.json();
+  assert.equal(body.registryRevision, 4);
+  assert.equal(body.frames[0].status, "unmapped");
+});

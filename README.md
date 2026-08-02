@@ -32,6 +32,15 @@ and each frame reports `exact`, `ancestor`, or `unmapped` plus the actual
 runs many resolve requests against one immutable snapshot captured at batch
 start, returning results in input order with per-item errors located by index.
 
+`POST /v1/lineage/preview` dry-runs the same batch against the same graph
+validation: it reports every rejection reason with the offending change index,
+flags a stale base revision, and — when valid — lists the releases whose
+resolution source would change, all without mutating state.
+`POST /v1/lineage/rollback` undoes a recorded batch as a brand-new validated
+revision (never by resurrecting an old one), so inverse changes pass through
+the identical unknown-version, cross-boundary, and cycle checks. Every
+committed batch is kept in a bounded history (last 50) for rollback targeting.
+
 The project intentionally uses Node.js built-ins only. `BundleRegistry` owns
 copy-on-write registry state, `RegistrySnapshot` owns detached read views,
 `SymbolResolver` owns request projection, and `ResolutionCache` only serves
