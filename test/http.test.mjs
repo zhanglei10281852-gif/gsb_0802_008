@@ -156,3 +156,58 @@ test('rolls back lineage over the HTTP boundary as a new revision', async (t) =>
   assert.equal(resolved.registryRevision, 4)
   assert.equal(resolved.frames[0].status, 'unmapped')
 })
+
+test('aborts batch work when the client disconnects mid-flight', async (t) => {
+  const registry = new BundleRegistry()
+  registry.put(bundle())
+  let started = 0
+  const resolver = new SymbolResolver(registry, {
+    maxConcurrency: 1,
+    beforeResolve: async ({ signal }) => {
+      started += 1
+      // Hang until the request is aborted so the client can disconnect first.
+      await new Promise((resolve) => {
+        if (signal.aborted) return resolve()
+        signal.addEventListener('abort', () => resolve(), { once: true })
+      })
+    }
+  })
+  const server = createApiServer({ registry, resolver })
+  const baseUrl = await listen(server)
+  t.after(() => server.close())
+
+  const controller = new AbortController()
+  const inflight = fetch(`${baseUrl}/v1/resolve/batch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ items: [resolveRequest(), resolveRequest({ frames: [{ file: 'x.js', line: 1, column: 0 }] })] }),
+    signal: controller.signal
+  })
+  // Give the server a moment to begin the first item, then disconnect.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  controller.abort()
+  await assert.rejects(inflight)
+  // The pool started at most the in-flight item, never the whole batch.
+  assert.ok(started <= 1, `expected disconnect to stop new work, ${started} started`)
+})
+
+test('times out a batch that runs too long and releases the response', async (t) => {
+  const registry = new BundleRegistry()
+  registry.put(bundle())
+  const resolver = new SymbolResolver(registry, {
+    maxConcurrency: 1,
+    beforeResolve: async ({ signal }) => {
+      await new Promise((resolve) => {
+        if (signal.aborted) return resolve()
+        signal.addEventListener('abort', () => resolve(), { once: true })
+      })
+    }
+  })
+  const server = createApiServer({ registry, resolver, batchTimeoutMs: 40 })
+  const baseUrl = await listen(server)
+  t.after(() => server.close())
+
+  const response = await post(baseUrl, '/v1/resolve/batch', { items: [resolveRequest()] })
+  assert.equal(response.status, 499)
+  assert.equal((await response.json()).error, 'request_cancelled')
+})

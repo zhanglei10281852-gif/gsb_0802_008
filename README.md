@@ -61,6 +61,17 @@ captured at the start, returns results in input order, and isolates a bad item
 (invalid input or missing bundle) to its own entry via `ok: false` and `index`
 without discarding the other results.
 
+Under production load the batch runs with bounded execution control that does
+not change any result semantics: a worker pool caps how many resolutions run at
+once, and identical items inside the same batch reuse a single resolution read
+(scoped to that snapshot's revision, so reuse never mixes old and new lineage).
+Duplicates still each receive their own detached, locatable result. The route
+runs the batch under an `AbortController` wired to the request timeout and the
+client connection — on cancellation, timeout, or disconnect the pool stops
+starting new work and releases the batch's read-reuse table promptly, and a
+batch that could not finish reports `499 request_cancelled`. Requests that begin
+after a lineage switch still observe the newer revision.
+
 The project intentionally uses Node.js built-ins only. `BundleRegistry` owns
 copy-on-write registry state (bundles, artifacts, lineage, and bounded lineage
 history), `lineage-engine.mjs` owns shared graph validation and impact

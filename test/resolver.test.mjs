@@ -181,10 +181,10 @@ test("walks a transitive lineage and reports the nearest matching ancestor", () 
   assert.equal(result.frames[1].resolvedFrom, "2026.08.1");
 });
 
-test("batch resolves over one shared snapshot and preserves input order", () => {
+test("batch resolves over one shared snapshot and preserves input order", async () => {
   const registry = hotfixRegistry();
   const resolver = new SymbolResolver(registry);
-  const batch = resolver.resolveBatch({
+  const batch = await resolver.resolveBatch({
     items: [
       resolveRequest({
         version: "2026.08.2",
@@ -204,10 +204,10 @@ test("batch resolves over one shared snapshot and preserves input order", () => 
   assert.equal(batch.results[1].frames[0].status, "exact");
 });
 
-test("batch isolates an invalid or missing item without dropping the rest", () => {
+test("batch isolates an invalid or missing item without dropping the rest", async () => {
   const registry = hotfixRegistry();
   const resolver = new SymbolResolver(registry);
-  const batch = resolver.resolveBatch({
+  const batch = await resolver.resolveBatch({
     items: [
       resolveRequest({ version: "2026.08.1" }),
       resolveRequest({ platform: "ios" }),
@@ -228,9 +228,9 @@ test("batch isolates an invalid or missing item without dropping the rest", () =
   assert.equal(batch.results[2].error, "invalid_frames");
 });
 
-test("rejects a batch envelope that is not a non-empty item array", () => {
+test("rejects a batch envelope that is not a non-empty item array", async () => {
   const resolver = new SymbolResolver(hotfixRegistry());
-  assert.throws(
+  await assert.rejects(
     () => resolver.resolveBatch({ items: [] }),
     (error) => error instanceof ApiError && error.code === "invalid_batch",
   );
