@@ -4,15 +4,25 @@ import { bundleKey, positionKey, readFrames, readIdentity } from './validation.m
 const copy = (value) => structuredClone(value)
 
 export class SymbolResolver {
-  constructor (registry) {
+  constructor (registry, { cache = null } = {}) {
     this.registry = registry
+    this.cache = cache
   }
 
   resolve (body) {
     const identity = readIdentity(body)
     const frames = readFrames(body.frames)
     const snapshot = this.registry.snapshot()
-    const bundle = snapshot.bundles.get(bundleKey(identity))
+    const requestKey = JSON.stringify({ identity, frames })
+    const cached = this.cache?.read(snapshot.revision, requestKey)
+    if (cached) return cached
+    const result = this.resolveSnapshot({ identity, frames, snapshot })
+    this.cache?.write(snapshot.revision, requestKey, result)
+    return result
+  }
+
+  resolveSnapshot ({ identity, frames, snapshot }) {
+    const bundle = snapshot.getBundle(identity)
     if (!bundle) throw new ApiError(404, 'bundle_not_found', 'No bundle exists for this release')
     return {
       application: identity.application,
