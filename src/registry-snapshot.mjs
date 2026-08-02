@@ -11,10 +11,16 @@ function cloneArtifact (artifact) {
 }
 
 export class RegistrySnapshot {
-  constructor ({ revision, bundles, artifacts }) {
+  constructor ({ revision, bundles, artifacts, lineage }) {
     this.revision = revision
     this.bundles = new Map([...bundles].map(([key, bundle]) => [key, copy(bundle)]))
     this.artifacts = new Map([...artifacts].map(([digest, artifact]) => [digest, cloneArtifact(artifact)]))
+    this.lineage = new Map([...lineage].map(([key, parent]) => [key, copy(parent)]))
+  }
+
+  getParent (identity) {
+    const parent = this.lineage.get(bundleKey(identity))
+    return parent ? copy(parent) : null
   }
 
   getBundle (identity) {

@@ -17,6 +17,29 @@ export function bundle (overrides = {}) {
   }
 }
 
+export function childBundle (overrides = {}) {
+  return bundle({
+    version: '2026.08.2',
+    mappings: [
+      {
+        generated: { file: 'checkout.js', line: 19, column: 0 },
+        source: { file: 'src/checkout-v2.ts', line: 90, column: 2 }
+      }
+    ],
+    ...overrides
+  })
+}
+
+export function lineageChange (overrides = {}) {
+  return {
+    application: 'mobile-shell',
+    platform: 'android',
+    version: '2026.08.2',
+    parent: { application: 'mobile-shell', platform: 'android', version: '2026.08.1' },
+    ...overrides
+  }
+}
+
 export function resolveRequest (overrides = {}) {
   return {
     application: 'mobile-shell',
