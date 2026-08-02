@@ -68,3 +68,60 @@ export function readFrames (value) {
 export function positionKey (position) {
   return `${position.file}\u0000${position.line}\u0000${position.column}`
 }
+
+export function readOptionalParentVersion (value) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new ApiError(400, 'invalid_parent_version', 'parentVersion must be a non-empty string when provided')
+  }
+  return value.trim()
+}
+
+export function readExpectedRevision (value) {
+  if (value === undefined || value === null) return null
+  if (!Number.isInteger(value) || value < 0) {
+    throw new ApiError(400, 'invalid_expected_revision', 'expectedRevision must be a non-negative integer')
+  }
+  return value
+}
+
+export function readLineageChanges (value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 500) {
+    throw new ApiError(400, 'invalid_lineage_changes', 'changes must contain between 1 and 500 items')
+  }
+  const seen = new Set()
+  return value.map((change, index) => {
+    if (!change || typeof change !== 'object' || Array.isArray(change)) {
+      throw new ApiError(400, 'invalid_lineage_change', `change at index ${index} must be an object`)
+    }
+    const identity = readIdentity(change)
+    const parentVersion = readOptionalParentVersion(change.parentVersion)
+    const key = bundleKey(identity)
+    if (seen.has(key)) {
+      throw new ApiError(400, 'duplicate_lineage_change', `release ${identity.application}/${identity.platform}/${identity.version} appears more than once in the batch`)
+    }
+    seen.add(key)
+    return { identity, parentVersion }
+  })
+}
+
+export function readBatchItems (value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 100) {
+    throw new ApiError(400, 'invalid_batch_items', 'items must contain between 1 and 100 entries')
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return { index, error: { code: 'invalid_item', message: `item at index ${index} must be an object` } }
+    }
+    try {
+      const identity = readIdentity(item)
+      const frames = readFrames(item.frames)
+      return { index, identity, frames }
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return { index, error: { code: error.code, message: error.message } }
+      }
+      throw error
+    }
+  })
+}
