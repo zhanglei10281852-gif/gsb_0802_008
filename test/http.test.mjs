@@ -3,7 +3,7 @@ import test from 'node:test'
 import { BundleRegistry } from '../src/bundle-registry.mjs'
 import { createApiServer } from '../src/http.mjs'
 import { SymbolResolver } from '../src/resolver.mjs'
-import { bundle, batchRequest, lineageRequest, listen, resolveRequest } from '../test-support/fixtures.mjs'
+import { bundle, batchRequest, lineageRequest, listen, resolveRequest, rollbackRequest } from '../test-support/fixtures.mjs'
 
 async function startServer (t) {
   const registry = new BundleRegistry()
@@ -109,4 +109,50 @@ test('resolves a batch over the HTTP boundary and isolates bad items', async (t)
   assert.equal(body.results[1].ok, false)
   assert.equal(body.results[1].index, 1)
   assert.equal(body.results[1].error, 'bundle_not_found')
+})
+
+test('previews lineage impact over the HTTP boundary without applying it', async (t) => {
+  const { baseUrl } = await startServer(t)
+  await post(baseUrl, '/v1/bundles', bundle())
+  await post(baseUrl, '/v1/bundles', bundle({ version: '2026.08.2' }))
+
+  const preview = await post(baseUrl, '/v1/lineage/preview', lineageRequest({ expectedRevision: 2 }))
+  assert.equal(preview.status, 200)
+  const body = await preview.json()
+  assert.equal(body.ok, true)
+  assert.equal(body.basedOnRevision, 2)
+  assert.equal(body.impact[0].version, '2026.08.2')
+  assert.deepEqual(body.impact[0].nextAncestry, ['2026.08.1'])
+
+  // Preview did not advance the registry.
+  const stale = await post(baseUrl, '/v1/lineage', lineageRequest({ expectedRevision: 1 }))
+  assert.equal(stale.status, 409)
+})
+
+test('rolls back lineage over the HTTP boundary as a new revision', async (t) => {
+  const { baseUrl } = await startServer(t)
+  await post(baseUrl, '/v1/bundles', bundle())
+  await post(baseUrl, '/v1/bundles', bundle({
+    version: '2026.08.2',
+    mappings: [{
+      generated: { file: 'hotfix.js', line: 1, column: 0 },
+      source: { file: 'src/hotfix.ts', line: 5, column: 2 }
+    }]
+  }))
+  const applied = await (await post(baseUrl, '/v1/lineage', lineageRequest({ expectedRevision: 2 }))).json()
+  assert.equal(applied.revision, 3)
+
+  const rollback = await post(baseUrl, '/v1/lineage/rollback', rollbackRequest({ expectedRevision: 3, toRevision: 2 }))
+  assert.equal(rollback.status, 200)
+  const body = await rollback.json()
+  assert.equal(body.operation, 'rollback')
+  assert.equal(body.revision, 4)
+  assert.equal(body.restoredFromRevision, 2)
+
+  const resolved = await (await post(baseUrl, '/v1/resolve', resolveRequest({
+    version: '2026.08.2',
+    frames: [{ file: 'app.js', line: 10, column: 2 }]
+  }))).json()
+  assert.equal(resolved.registryRevision, 4)
+  assert.equal(resolved.frames[0].status, 'unmapped')
 })

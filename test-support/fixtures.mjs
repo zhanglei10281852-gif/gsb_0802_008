@@ -37,6 +37,16 @@ export function lineageRequest (overrides = {}) {
   }
 }
 
+export function rollbackRequest (overrides = {}) {
+  return {
+    application: 'mobile-shell',
+    platform: 'android',
+    expectedRevision: 0,
+    toRevision: 0,
+    ...overrides
+  }
+}
+
 export function batchRequest (overrides = {}) {
   return {
     items: [resolveRequest()],

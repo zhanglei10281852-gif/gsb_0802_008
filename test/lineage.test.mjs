@@ -106,6 +106,7 @@ test('does not create the bundle content by declaring lineage', () => {
     revision: 3,
     releaseCount: 2,
     artifactCount: 2,
-    lineageCount: 1
+    lineageCount: 1,
+    historyDepth: 2
   })
 })

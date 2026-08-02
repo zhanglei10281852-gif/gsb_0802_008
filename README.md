@@ -29,6 +29,26 @@ revision is untouched. A stale `expectedRevision` returns `409 revision_conflict
 Lineage is declared explicitly — it is never inferred from version strings, and
 declaring it never re-uploads or mutates bundle content.
 
+`POST /v1/lineage/preview` runs the exact same graph validation and impact math
+as apply but changes nothing. It returns `ok`, a structured `rejection` reason
+when the change would be refused, and an `impact` list of the releases whose
+declared ancestry (and therefore resolution source) would move, each with its
+`previousAncestry` and `nextAncestry`.
+
+`POST /v1/lineage/rollback` accepts an application, platform, `expectedRevision`,
+and a `toRevision`. It restores that scope's lineage to the historical
+checkpoint as a brand-new validated revision — it never resurrects the old
+revision number, never revives a release that no longer exists, and only touches
+edges inside the requested application/platform boundary. A bounded history of
+recent lineage checkpoints is retained; rolling back to a revision older than the
+retained window is refused rather than guessed.
+
+Preview, apply, and rollback share one graph-validation and impact engine
+(`lineage-engine.mjs`); the HTTP routes stay thin and never re-implement the
+rules. Every lineage mutation forms a new immutable revision: requests that
+started after a switch see only the new revision, while a request that already
+captured an older snapshot completes entirely within that view.
+
 Resolution stays exact-first: a frame resolves against the requested release
 when that position exists, otherwise it walks the declared lineage nearest
 ancestor first. Every frame reports `status` (`exact`, `ancestor`, or
@@ -42,8 +62,9 @@ captured at the start, returns results in input order, and isolates a bad item
 without discarding the other results.
 
 The project intentionally uses Node.js built-ins only. `BundleRegistry` owns
-copy-on-write registry state (bundles, artifacts, and lineage),
-`RegistrySnapshot` owns detached read views and ancestor traversal,
-`SymbolResolver` owns request projection and batch fan-out, `ResolutionCache`
-only serves results for the registry revision that produced them, and
-`createServices` wires them together for the server and tests.
+copy-on-write registry state (bundles, artifacts, lineage, and bounded lineage
+history), `lineage-engine.mjs` owns shared graph validation and impact
+computation, `RegistrySnapshot` owns detached read views and ancestor
+traversal, `SymbolResolver` owns request projection and batch fan-out,
+`ResolutionCache` only serves results for the registry revision that produced
+them, and `createServices` wires them together for the server and tests.

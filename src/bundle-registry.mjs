@@ -1,15 +1,22 @@
 import { createHash } from "node:crypto";
-import { ApiError } from "./errors.mjs";
+import { ApiError, toApiError } from "./errors.mjs";
 import { RegistrySnapshot } from "./registry-snapshot.mjs";
+import {
+  computeImpact,
+  planAddition,
+  planRollback,
+} from "./lineage-engine.mjs";
 import {
   bundleKey,
   positionKey,
   readIdentity,
   readLineageRequest,
+  readRollbackRequest,
   readMappings,
 } from "./validation.mjs";
 
 const copy = (value) => structuredClone(value);
+const HISTORY_LIMIT = 64;
 
 function digestMappings(mappings) {
   const canonical = mappings.map(({ generated, source }) => ({
@@ -32,30 +39,13 @@ function toArtifact(mappings, digest) {
   };
 }
 
-function assertAcyclic(lineage) {
-  for (const start of lineage.keys()) {
-    const seen = new Set([start]);
-    let current = lineage.get(start);
-    while (current !== undefined) {
-      if (seen.has(current)) {
-        throw new ApiError(
-          422,
-          "lineage_cycle",
-          "Relations would introduce a cycle in the version lineage",
-        );
-      }
-      seen.add(current);
-      current = lineage.get(current);
-    }
-  }
-}
-
 export class BundleRegistry {
   #state = {
     revision: 0,
     bundles: new Map(),
     artifacts: new Map(),
     lineage: new Map(),
+    history: [{ revision: 0, lineage: new Map() }],
   };
 
   put(body) {
@@ -76,12 +66,8 @@ export class BundleRegistry {
       mappingCount: mappings.length,
       registeredAtRevision: nextRevision,
     });
-    this.#state = {
-      revision: nextRevision,
-      bundles,
-      artifacts,
-      lineage: previous.lineage,
-    };
+    // A bundle upload never changes lineage, so history carries forward as-is.
+    this.#state = { ...previous, revision: nextRevision, bundles, artifacts };
     return {
       ...identity,
       revision: nextRevision,
@@ -91,101 +77,96 @@ export class BundleRegistry {
     };
   }
 
+  previewLineage(body) {
+    const request = readLineageRequest(body);
+    const previous = this.#state;
+    const scope = {
+      application: request.application,
+      platform: request.platform,
+    };
+    try {
+      this.#assertRevision(previous, request.expectedRevision);
+      const { nextLineage, changeCount } = planAddition({
+        bundles: previous.bundles,
+        lineage: previous.lineage,
+        scope,
+        relations: request.relations,
+      });
+      const impact = computeImpact({
+        bundles: previous.bundles,
+        scope,
+        before: previous.lineage,
+        after: nextLineage,
+      });
+      return {
+        ...scope,
+        basedOnRevision: previous.revision,
+        ok: true,
+        rejection: null,
+        changeCount,
+        impact,
+      };
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+      const known = toApiError(error);
+      return {
+        ...scope,
+        basedOnRevision: previous.revision,
+        ok: false,
+        rejection: { code: known.code, message: known.message },
+        changeCount: 0,
+        impact: [],
+      };
+    }
+  }
+
   applyLineage(body) {
     const request = readLineageRequest(body);
     const previous = this.#state;
-    if (request.expectedRevision !== previous.revision) {
+    const scope = {
+      application: request.application,
+      platform: request.platform,
+    };
+    this.#assertRevision(previous, request.expectedRevision);
+    const { nextLineage, changeCount } = planAddition({
+      bundles: previous.bundles,
+      lineage: previous.lineage,
+      scope,
+      relations: request.relations,
+    });
+    return this.#commitLineage(previous, scope, nextLineage, {
+      operation: "apply",
+      changeCount,
+    });
+  }
+
+  rollbackLineage(body) {
+    const request = readRollbackRequest(body);
+    const previous = this.#state;
+    const scope = {
+      application: request.application,
+      platform: request.platform,
+    };
+    this.#assertRevision(previous, request.expectedRevision);
+    if (request.toRevision > previous.revision) {
       throw new ApiError(
-        409,
-        "revision_conflict",
-        `Registry is at revision ${previous.revision}, not ${request.expectedRevision}`,
+        422,
+        "unknown_target_revision",
+        `Revision ${request.toRevision} does not exist yet`,
       );
     }
-
-    const scopeApplication = request.application;
-    const scopePlatform = request.platform;
-    const declaredChildren = new Set();
-    const additions = [];
-
-    for (const relation of request.relations) {
-      if (
-        relation.application !== scopeApplication ||
-        relation.platform !== scopePlatform
-      ) {
-        throw new ApiError(
-          422,
-          "cross_boundary_relation",
-          `Relation ${relation.version}->${relation.parent} crosses the ${scopeApplication}/${scopePlatform} boundary`,
-        );
-      }
-      if (relation.version === relation.parent) {
-        throw new ApiError(
-          422,
-          "lineage_cycle",
-          `Relation ${relation.version}->${relation.parent} is self-referential`,
-        );
-      }
-      const childKey = bundleKey({
-        application: scopeApplication,
-        platform: scopePlatform,
-        version: relation.version,
-      });
-      const parentKey = bundleKey({
-        application: scopeApplication,
-        platform: scopePlatform,
-        version: relation.parent,
-      });
-      if (!previous.bundles.has(childKey)) {
-        throw new ApiError(
-          422,
-          "unknown_version",
-          `No bundle exists for version ${relation.version}`,
-        );
-      }
-      if (!previous.bundles.has(parentKey)) {
-        throw new ApiError(
-          422,
-          "unknown_version",
-          `No bundle exists for version ${relation.parent}`,
-        );
-      }
-      if (declaredChildren.has(childKey)) {
-        throw new ApiError(
-          422,
-          "duplicate_relation",
-          `Version ${relation.version} is assigned more than one parent in this batch`,
-        );
-      }
-      if (previous.lineage.get(childKey) === parentKey) {
-        throw new ApiError(
-          422,
-          "duplicate_relation",
-          `Relation ${relation.version}->${relation.parent} already exists`,
-        );
-      }
-      declaredChildren.add(childKey);
-      additions.push({ childKey, parentKey });
-    }
-
-    const lineage = new Map(previous.lineage);
-    for (const { childKey, parentKey } of additions)
-      lineage.set(childKey, parentKey);
-    assertAcyclic(lineage);
-
-    const nextRevision = previous.revision + 1;
-    this.#state = {
-      revision: nextRevision,
+    const checkpoint = this.#historyAt(previous, request.toRevision);
+    const { nextLineage, changeCount } = planRollback({
       bundles: previous.bundles,
-      artifacts: previous.artifacts,
-      lineage,
-    };
-    return {
-      application: scopeApplication,
-      platform: scopePlatform,
-      revision: nextRevision,
-      appliedRelations: additions.length,
-      lineageSize: lineage.size,
-    };
+      lineage: previous.lineage,
+      scope,
+      targetLineage: checkpoint.lineage,
+    });
+    return this.#commitLineage(previous, scope, nextLineage, {
+      operation: "rollback",
+      changeCount,
+      restoredFromRevision: request.toRevision,
+    });
   }
 
   snapshot() {
@@ -209,6 +190,63 @@ export class BundleRegistry {
       releaseCount: this.#state.bundles.size,
       artifactCount: this.#state.artifacts.size,
       lineageCount: this.#state.lineage.size,
+      historyDepth: this.#state.history.length,
+    };
+  }
+
+  #assertRevision(previous, expectedRevision) {
+    if (expectedRevision !== previous.revision) {
+      throw new ApiError(
+        409,
+        "revision_conflict",
+        `Registry is at revision ${previous.revision}, not ${expectedRevision}`,
+      );
+    }
+  }
+
+  // Returns the lineage checkpoint in effect at the requested revision: the most
+  // recent recorded state at or before it. Throws when history no longer retains
+  // a snapshot old enough, since we refuse to guess an evicted state.
+  #historyAt(previous, toRevision) {
+    let match = null;
+    for (const entry of previous.history) {
+      if (entry.revision <= toRevision) match = entry;
+    }
+    if (!match) {
+      throw new ApiError(
+        422,
+        "revision_unavailable",
+        `Revision ${toRevision} is older than the retained lineage history`,
+      );
+    }
+    return match;
+  }
+
+  #commitLineage(previous, scope, nextLineage, meta) {
+    const nextRevision = previous.revision + 1;
+    const history = [
+      ...previous.history,
+      { revision: nextRevision, lineage: new Map(nextLineage) },
+    ];
+    while (history.length > HISTORY_LIMIT) history.shift();
+    this.#state = {
+      ...previous,
+      revision: nextRevision,
+      lineage: nextLineage,
+      history,
+    };
+    return {
+      ...scope,
+      revision: nextRevision,
+      operation: meta.operation,
+      changeCount: meta.changeCount,
+      lineageSize: nextLineage.size,
+      ...(meta.operation === "apply"
+        ? { appliedRelations: meta.changeCount }
+        : {}),
+      ...(meta.restoredFromRevision !== undefined
+        ? { restoredFromRevision: meta.restoredFromRevision }
+        : {}),
     };
   }
 }
