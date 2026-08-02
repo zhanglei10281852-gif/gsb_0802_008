@@ -109,7 +109,7 @@ test('does not cross application or platform boundaries while walking ancestors'
   )
 })
 
-test('resolveBatch shares one immutable snapshot and isolates per-item errors', () => {
+test('resolveBatch shares one immutable snapshot and isolates per-item errors', async () => {
   const registry = new BundleRegistry()
   registry.put(bundle())
   registry.put(bundle({
@@ -120,7 +120,7 @@ test('resolveBatch shares one immutable snapshot and isolates per-item errors', 
     }]
   }))
   const resolver = new SymbolResolver(registry)
-  const result = resolver.resolveBatch({ items: [
+  const result = await resolver.resolveBatch({ items: [
     resolveRequest({ frames: [{ file: 'app.js', line: 10, column: 2 }] }),
     resolveRequest({ version: 'missing-version' }),
     { application: 'mobile-shell', platform: 'android', version: '2026.08.2', frames: [] },
