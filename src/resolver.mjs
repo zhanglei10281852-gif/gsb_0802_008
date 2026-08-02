@@ -131,6 +131,10 @@ export class SymbolResolver {
       else groups.set(key, { ...parsed, indices: [index] });
     });
     const queue = [...groups.values()];
+    const lease = this.registry.acquireReadLease(
+      snapshot,
+      queue.map((group) => group.identity),
+    );
     const worker = async () => {
       while (queue.length > 0) {
         if (signal?.aborted) throw abortedError();
@@ -159,6 +163,8 @@ export class SymbolResolver {
       queue.length = 0;
       groups.clear();
       throw error;
+    } finally {
+      lease.release();
     }
     for (const group of groups.values()) {
       for (const index of group.indices) {

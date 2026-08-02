@@ -52,6 +52,40 @@ disconnect, or the optional `BATCH_TIMEOUT_MS` deadline aborts the batch with
 batch's read state is dropped immediately. A slow batch always finishes on
 the snapshot it started with, even if lineage changes commit around it.
 
+`POST /v1/gc/preview` and `POST /v1/gc` close the content lifecycle. A
+release can be collected only when it is not an ancestor in the current
+lineage, not referenced by the retained rollback history window, and not read
+by an active batch lease; artifacts are freed only when no remaining release
+references them (content orphaned by a replaced upload is always safe). The
+preview lists every blocking reason per release plus the artifacts that would
+be freed; the real collection re-validates against the previewed revision and
+the live leases, and fails with 409 if anything changed — deletion has no
+undo, so nothing is removed on a stale view.
+
+## Maintenance notes
+
+- **Revision switching.** Every mutation (bundle upload, lineage apply or
+  rollback, garbage collection) commits a brand-new copy-on-write state with
+  a monotonically increasing revision. Writers pass the revision they based
+  their decision on; a mismatch answers 409 and changes nothing. Readers only
+  ever see fully committed states.
+- **History retention.** The last 50 lineage commits are kept for rollback
+  targeting. Older entries are forgotten, rollback only works inside the
+  window, and rollback is itself a new commit — old revisions are never
+  resurrected. Garbage collection is not rollbackable by design.
+- **Batch stability.** A batch captures one immutable snapshot when it
+  starts; deduplicated reads are scoped to that snapshot and revision;
+  concurrent lineage commits or collections land on new revisions and never
+  leak into a running batch, which finishes on the view it started with.
+- **Cancellation.** Client disconnect or the batch timeout aborts the batch:
+  workers stop before starting new resolution units, the pending queue and
+  deduplicated results are dropped, the batch's read leases are released, and
+  no response is written to the dead connection.
+- **Safe collection.** Always preview first and collect on the same revision.
+  Collection is refused while any current lineage chain, retained history
+  entry, or active batch lease references the target; the checks run again at
+  commit time, so a release can never be deleted out from under a reader.
+
 The project intentionally uses Node.js built-ins only. `BundleRegistry` owns
 copy-on-write registry state, `RegistrySnapshot` owns detached read views,
 `SymbolResolver` owns request projection, and `ResolutionCache` only serves

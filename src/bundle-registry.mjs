@@ -4,6 +4,7 @@ import { RegistrySnapshot } from "./registry-snapshot.mjs";
 import {
   bundleKey,
   positionKey,
+  readGcRequest,
   readIdentity,
   readLineageRequest,
   readMappings,
@@ -65,6 +66,7 @@ export class BundleRegistry {
     lineage: new Map(),
   };
   #history = [];
+  #leases = new Map();
 
   put(body) {
     const identity = readIdentity(body);
@@ -253,6 +255,167 @@ export class BundleRegistry {
     }));
     const committed = this.#commitLineage({ revision, changes: inverse });
     return { ...committed, revertedFrom: target };
+  }
+
+  acquireReadLease(snapshot, identities) {
+    const keys = new Set();
+    for (const identity of identities) {
+      keys.add(bundleKey(identity));
+      let parent = snapshot.getParent(identity);
+      while (parent) {
+        keys.add(bundleKey(parent));
+        parent = snapshot.getParent(parent);
+      }
+    }
+    for (const key of keys) {
+      this.#leases.set(key, (this.#leases.get(key) ?? 0) + 1);
+    }
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        for (const key of keys) {
+          const count = this.#leases.get(key) ?? 0;
+          if (count <= 1) this.#leases.delete(key);
+          else this.#leases.set(key, count - 1);
+        }
+      },
+    };
+  }
+
+  #planGc(releases) {
+    const previous = this.#state;
+    const violations = [];
+    const seen = new Set();
+    const targets = [];
+    releases.forEach((identity, index) => {
+      const key = bundleKey(identity);
+      if (seen.has(key)) {
+        violations.push({
+          code: "duplicate_release",
+          message: "The same release appears more than once",
+          releaseIndex: index,
+        });
+        return;
+      }
+      seen.add(key);
+      const descriptor = previous.bundles.get(key);
+      if (!descriptor) {
+        violations.push({
+          code: "unknown_version",
+          message: `No bundle exists for release ${identity.version}`,
+          releaseIndex: index,
+        });
+        return;
+      }
+      for (const childKey of previous.lineage.keys()) {
+        const referenced = ancestorChain(childKey, previous.lineage).some(
+          (parent) => bundleKey(parent) === key,
+        );
+        if (referenced) {
+          violations.push({
+            code: "lineage_referenced",
+            message: "Release is an ancestor in the current lineage",
+            releaseIndex: index,
+          });
+          return;
+        }
+      }
+      const inHistory = this.#history.some((entry) =>
+        entry.changes.some(
+          (change) =>
+            bundleKey(change) === key ||
+            (change.from !== null && bundleKey(change.from) === key) ||
+            (change.to !== null && bundleKey(change.to) === key),
+        ),
+      );
+      if (inHistory) {
+        violations.push({
+          code: "history_referenced",
+          message: "Release is referenced by the rollback history window",
+          releaseIndex: index,
+        });
+        return;
+      }
+      if ((this.#leases.get(key) ?? 0) > 0) {
+        violations.push({
+          code: "lease_active",
+          message: "Release is read by an active batch",
+          releaseIndex: index,
+        });
+        return;
+      }
+      targets.push({ key, descriptor });
+    });
+    if (violations.length > 0) {
+      return { previous, violations, targets: [], freedArtifacts: [] };
+    }
+    const remainingDigests = new Set();
+    for (const [key, descriptor] of previous.bundles) {
+      if (!seen.has(key)) remainingDigests.add(descriptor.digest);
+    }
+    const freedArtifacts = [];
+    for (const digest of previous.artifacts.keys()) {
+      if (!remainingDigests.has(digest)) freedArtifacts.push(digest);
+    }
+    return { previous, violations, targets, freedArtifacts };
+  }
+
+  previewGc(body) {
+    const { revision, releases } = readGcRequest(body);
+    const plan = this.#planGc(releases);
+    const valid = plan.violations.length === 0;
+    return {
+      revision: this.#state.revision,
+      baseRevision: revision,
+      stale: revision !== this.#state.revision,
+      valid,
+      violations: plan.violations,
+      impact: valid
+        ? {
+            removableReleases: plan.targets.map((target) =>
+              copy(target.descriptor.identity),
+            ),
+            freedArtifacts: plan.freedArtifacts,
+          }
+        : null,
+    };
+  }
+
+  collectGarbage(body) {
+    const { revision, releases } = readGcRequest(body);
+    if (revision !== this.#state.revision) {
+      throw new ApiError(
+        409,
+        "revision_conflict",
+        "Registry revision has changed; reload and retry",
+      );
+    }
+    const plan = this.#planGc(releases);
+    if (plan.violations.length > 0) {
+      const first = plan.violations[0];
+      const statusCode =
+        first.code === "unknown_version" || first.code === "duplicate_release"
+          ? 400
+          : 409;
+      throw new ApiError(statusCode, first.code, first.message);
+    }
+    const bundles = new Map(plan.previous.bundles);
+    const artifacts = new Map(plan.previous.artifacts);
+    const lineage = new Map(plan.previous.lineage);
+    for (const target of plan.targets) {
+      bundles.delete(target.key);
+      lineage.delete(target.key);
+    }
+    for (const digest of plan.freedArtifacts) artifacts.delete(digest);
+    const nextRevision = plan.previous.revision + 1;
+    this.#state = { revision: nextRevision, bundles, artifacts, lineage };
+    return {
+      revision: nextRevision,
+      removed: plan.targets.length,
+      freedArtifacts: plan.freedArtifacts,
+    };
   }
 
   snapshot() {

@@ -440,3 +440,178 @@ test("answers 408 when a stalled batch exceeds the server timeout", async (t) =>
   assert.equal(response.status, 408);
   assert.equal((await response.json()).error, "batch_aborted");
 });
+
+test("runs the full lifecycle consistently over HTTP", async (t) => {
+  const registry = new BundleRegistry();
+  const server = createApiServer({
+    registry,
+    resolver: new SymbolResolver(registry),
+  });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await post(baseUrl, "/v1/bundles", bundle());
+  await post(baseUrl, "/v1/bundles", childBundle());
+  await post(
+    baseUrl,
+    "/v1/bundles",
+    bundle({
+      version: "2026.08.3",
+      mappings: [
+        {
+          generated: { file: "unique.js", line: 1, column: 0 },
+          source: { file: "unique.ts", line: 1, column: 0 },
+        },
+      ],
+    }),
+  );
+  await post(baseUrl, "/v1/lineage", {
+    revision: 3,
+    changes: [lineageChange()],
+  });
+
+  const ancestor = await post(
+    baseUrl,
+    "/v1/resolve",
+    resolveRequest({
+      version: "2026.08.2",
+      frames: [{ file: "app.js", line: 10, column: 2 }],
+    }),
+  );
+  assert.equal((await ancestor.json()).frames[0].status, "ancestor");
+
+  const blockedPreview = await post(baseUrl, "/v1/gc/preview", {
+    revision: 4,
+    releases: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.1",
+      },
+    ],
+  });
+  assert.equal(blockedPreview.status, 200);
+  const blockedReport = await blockedPreview.json();
+  assert.equal(blockedReport.valid, false);
+  assert.deepEqual(
+    blockedReport.violations.map((violation) => violation.code),
+    ["lineage_referenced"],
+  );
+
+  const rolledBack = await post(baseUrl, "/v1/lineage/rollback", {
+    revision: 4,
+    target: 4,
+  });
+  assert.equal(rolledBack.status, 200);
+
+  const stillBlocked = await post(baseUrl, "/v1/gc", {
+    revision: 5,
+    releases: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.1",
+      },
+    ],
+  });
+  assert.equal(stillBlocked.status, 409);
+  assert.equal((await stillBlocked.json()).error, "history_referenced");
+
+  const removed = await post(baseUrl, "/v1/gc", {
+    revision: 5,
+    releases: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.3",
+      },
+    ],
+  });
+  assert.equal(removed.status, 200);
+  const removedBody = await removed.json();
+  assert.equal(removedBody.revision, 6);
+  assert.equal(removedBody.removed, 1);
+  assert.equal(removedBody.freedArtifacts.length, 1);
+
+  const stale = await post(baseUrl, "/v1/gc", {
+    revision: 5,
+    releases: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.3",
+      },
+    ],
+  });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).error, "revision_conflict");
+
+  const gone = await post(
+    baseUrl,
+    "/v1/resolve",
+    resolveRequest({ version: "2026.08.3" }),
+  );
+  assert.equal(gone.status, 404);
+  assert.equal((await gone.json()).error, "bundle_not_found");
+
+  const intact = await post(baseUrl, "/v1/resolve", resolveRequest());
+  assert.equal(intact.status, 200);
+  assert.equal((await intact.json()).frames[0].status, "exact");
+});
+
+test("blocks collection over HTTP while a batch is in flight", async (t) => {
+  const pending = [];
+  const schedule = () => new Promise((resolve) => pending.push(resolve));
+  const registry = new BundleRegistry();
+  const resolver = new SymbolResolver(registry, { schedule });
+  const server = createApiServer({ registry, resolver });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await post(baseUrl, "/v1/bundles", bundle());
+
+  const client = new AbortController();
+  const batch = fetch(`${baseUrl}/v1/resolve/batch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ requests: [resolveRequest()] }),
+    signal: client.signal,
+  });
+  batch.catch(() => {});
+  for (let step = 0; step < 100 && pending.length === 0; step += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(pending.length > 0);
+
+  const during = await post(baseUrl, "/v1/gc/preview", {
+    revision: 1,
+    releases: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.1",
+      },
+    ],
+  });
+  const duringReport = await during.json();
+  assert.equal(duringReport.valid, false);
+  assert.equal(duringReport.violations[0].code, "lease_active");
+
+  client.abort();
+  for (let step = 0; step < 100; step += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  while (pending.length > 0) pending.shift()();
+
+  const after = await post(baseUrl, "/v1/gc/preview", {
+    revision: 1,
+    releases: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.1",
+      },
+    ],
+  });
+  assert.equal((await after.json()).valid, true);
+});
