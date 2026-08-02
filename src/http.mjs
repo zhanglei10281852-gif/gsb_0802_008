@@ -48,6 +48,14 @@ export function createApiServer ({ registry, resolver, batchTimeoutMs = 30000 })
         send(response, 200, registry.adjustLineage(await readJson(request)))
         return
       }
+      if (request.method === 'POST' && path === '/v1/gc/preview') {
+        send(response, 200, registry.previewGarbageCollection(await readJson(request)))
+        return
+      }
+      if (request.method === 'POST' && path === '/v1/gc') {
+        send(response, 200, registry.collectGarbage(await readJson(request)))
+        return
+      }
       if (request.method === 'POST' && path === '/v1/resolve') {
         send(response, 200, resolver.resolve(await readJson(request)))
         return

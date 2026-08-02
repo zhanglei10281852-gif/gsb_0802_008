@@ -84,45 +84,59 @@ export class SymbolResolver {
     return result
   }
 
-  async resolveBatch (body, { signal } = {}) {
-    const requests = readBatchBody(body)
-    const snapshot = this.registry.snapshot()
+  async resolveBatch(body, { signal } = {}) {
+    const requests = readBatchBody(body);
+    const lease = this.registry.acquireLease();
+    const snapshot = this.registry.snapshot();
 
-    const finalResults = new Array(requests.length)
-    const jobs = []
-    const dedup = new Map()
+    const finalResults = new Array(requests.length);
+    const jobs = [];
+    const dedup = new Map();
 
     for (let i = 0; i < requests.length; i++) {
-      const item = requests[i]
+      const item = requests[i];
       try {
-        if (!item || typeof item !== 'object' || Array.isArray(item)) {
-          throw new ApiError(400, 'invalid_request', 'each batch item must be an object')
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          throw new ApiError(400, "invalid_request", "each batch item must be an object");
         }
-        const identity = readIdentity(item)
-        const frames = readFrames(item.frames)
-        const key = JSON.stringify({ a: identity.application, p: identity.platform, v: identity.version, f: frames })
-        let job = dedup.get(key)
+        const identity = readIdentity(item);
+        const frames = readFrames(item.frames);
+        const key = JSON.stringify({
+          a: identity.application,
+          p: identity.platform,
+          v: identity.version,
+          f: frames,
+        });
+        let job = dedup.get(key);
         if (!job) {
-          job = { identity, frames, indices: [] }
-          dedup.set(key, job)
-          jobs.push(job)
+          job = { identity, frames, indices: [] };
+          dedup.set(key, job);
+          jobs.push(job);
         }
-        job.indices.push(i)
+        job.indices.push(i);
       } catch (error) {
-        const known = toApiError(error)
-        finalResults[i] = { index: i, ok: false, error: { code: known.code, message: known.message } }
+        const known = toApiError(error);
+        finalResults[i] = {
+          index: i,
+          ok: false,
+          error: { code: known.code, message: known.message },
+        };
       }
     }
 
-    const jobOutcomes = await this.#runJobs(jobs, snapshot, signal)
+    try {
+      const jobOutcomes = await this.#runJobs(jobs, snapshot, signal);
 
-    for (let j = 0; j < jobs.length; j++) {
-      for (const out of jobOutcomes[j]) {
-        finalResults[out.index] = out
+      for (let j = 0; j < jobs.length; j++) {
+        for (const out of jobOutcomes[j]) {
+          finalResults[out.index] = out;
+        }
       }
-    }
 
-    return { registryRevision: snapshot.revision, results: finalResults }
+      return { registryRevision: snapshot.revision, results: finalResults };
+    } finally {
+      lease.release();
+    }
   }
 
   async #runJobs (jobs, snapshot, signal) {
