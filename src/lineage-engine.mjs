@@ -110,3 +110,53 @@ export function computeImpact ({ bundles, scope, before, after }) {
   affected.sort((a, b) => (a.version < b.version ? -1 : a.version > b.version ? 1 : 0))
   return affected
 }
+
+// Decides, for a set of requested versions in one scope, which releases may be
+// safely reclaimed and which are blocked because their content is still reachable.
+// A release is reclaimable only when nothing currently references its bundle key:
+// not the live lineage graph, not the retained rollback-history window, and not
+// an active batch read lease. Artifact content is freed only once no surviving
+// bundle still references its digest, so reclamation can never orphan a map that
+// another release shares. This is a pure decision: it mutates nothing.
+export function planReclaim ({ bundles, scope, versions, lineageKeys, historyKeys, leasedKeys }) {
+  const reclaimable = []
+  const blocked = []
+  const survivingKeys = new Set(bundles.keys())
+
+  for (const version of versions) {
+    const key = bundleKey({ ...scope, version })
+    if (!bundles.has(key)) {
+      blocked.push({ ...scope, version, reason: 'unknown_version' })
+      continue
+    }
+    const reasons = []
+    if (lineageKeys.has(key)) reasons.push('referenced_by_lineage')
+    if (historyKeys.has(key)) reasons.push('referenced_by_history')
+    if (leasedKeys.has(key)) reasons.push('referenced_by_active_batch')
+    if (reasons.length > 0) {
+      blocked.push({ ...scope, version, reasons })
+    } else {
+      reclaimable.push({ ...scope, version, key })
+    }
+  }
+
+  // A digest is freed only if every surviving bundle (all bundles minus the ones
+  // being reclaimed) no longer references it.
+  const removedKeys = new Set(reclaimable.map((entry) => entry.key))
+  for (const key of removedKeys) survivingKeys.delete(key)
+  const survivingDigests = new Set()
+  for (const key of survivingKeys) survivingDigests.add(bundles.get(key).digest)
+  const freedDigests = []
+  for (const entry of reclaimable) {
+    const digest = bundles.get(entry.key).digest
+    if (!survivingDigests.has(digest) && !freedDigests.includes(digest)) {
+      freedDigests.push(digest)
+    }
+  }
+
+  return {
+    reclaimable: reclaimable.map(({ application, platform, version, key }) => ({ application, platform, version, key })),
+    blocked,
+    freedDigests
+  }
+}

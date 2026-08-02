@@ -207,6 +207,51 @@ export function readRollbackRequest(value) {
   };
 }
 
+export function readReclaimRequest(value, { requireRevision = false } = {}) {
+  const scope = readScope(value);
+  if (
+    !Array.isArray(value.versions) ||
+    value.versions.length === 0 ||
+    value.versions.length > 500
+  ) {
+    throw new ApiError(
+      400,
+      "invalid_versions",
+      "versions must contain between 1 and 500 items",
+    );
+  }
+  const versions = value.versions.map((version) => {
+    if (typeof version !== "string" || version.trim().length === 0) {
+      throw new ApiError(
+        400,
+        "invalid_version",
+        "every version must be a non-empty string",
+      );
+    }
+    return version.trim();
+  });
+  let expectedRevision = null;
+  if (requireRevision || "expectedRevision" in value) {
+    if (
+      !Number.isInteger(value.expectedRevision) ||
+      value.expectedRevision < 0
+    ) {
+      throw new ApiError(
+        400,
+        "invalid_revision",
+        "expectedRevision must be a non-negative integer",
+      );
+    }
+    expectedRevision = value.expectedRevision;
+  }
+  return {
+    application: scope.application,
+    platform: scope.platform,
+    versions,
+    expectedRevision,
+  };
+}
+
 export function readMappings(value) {
   if (!Array.isArray(value) || value.length === 0) {
     throw new ApiError(

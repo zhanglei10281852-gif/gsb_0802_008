@@ -4,6 +4,7 @@ import { RegistrySnapshot } from "./registry-snapshot.mjs";
 import {
   computeImpact,
   planAddition,
+  planReclaim,
   planRollback,
 } from "./lineage-engine.mjs";
 import {
@@ -11,6 +12,7 @@ import {
   positionKey,
   readIdentity,
   readLineageRequest,
+  readReclaimRequest,
   readRollbackRequest,
   readMappings,
 } from "./validation.mjs";
@@ -47,6 +49,13 @@ export class BundleRegistry {
     lineage: new Map(),
     history: [{ revision: 0, lineage: new Map() }],
   };
+
+  // Active batch read leases, keyed by an opaque lease id. Each lease pins the
+  // set of bundle keys that were live when the batch captured its snapshot, so
+  // reclamation cannot delete content an in-flight batch may still read. Leases
+  // are transient runtime resources, deliberately outside the revisioned state.
+  #leases = new Map();
+  #leaseSeq = 0;
 
   put(body) {
     const identity = readIdentity(body);
@@ -169,6 +178,95 @@ export class BundleRegistry {
     });
   }
 
+  // Acquires a read lease pinning every bundle key live at the current revision.
+  // A batch calls this at snapshot capture and releases it when it finishes or is
+  // cancelled, guaranteeing reclamation never deletes content mid-read.
+  acquireLease() {
+    const id = ++this.#leaseSeq;
+    this.#leases.set(id, new Set(this.#state.bundles.keys()));
+    return id;
+  }
+
+  releaseLease(id) {
+    this.#leases.delete(id);
+  }
+
+  previewReclaim(body) {
+    const request = readReclaimRequest(body);
+    const previous = this.#state;
+    const scope = {
+      application: request.application,
+      platform: request.platform,
+    };
+    const plan = planReclaim({
+      bundles: previous.bundles,
+      scope,
+      versions: request.versions,
+      lineageKeys: this.#lineageKeys(previous),
+      historyKeys: this.#historyKeys(previous),
+      leasedKeys: this.#leasedKeys(),
+    });
+    return {
+      ...scope,
+      basedOnRevision: previous.revision,
+      reclaimable: plan.reclaimable.map(
+        ({ application, platform, version }) => ({
+          application,
+          platform,
+          version,
+        }),
+      ),
+      blocked: plan.blocked,
+      freedArtifacts: plan.freedDigests.length,
+    };
+  }
+
+  reclaimBundles(body) {
+    const request = readReclaimRequest(body, { requireRevision: true });
+    const previous = this.#state;
+    const scope = {
+      application: request.application,
+      platform: request.platform,
+    };
+    // Formal reclamation is bound to the revision the preview observed: if the
+    // registry moved on, we refuse rather than act on a stale safety decision.
+    this.#assertRevision(previous, request.expectedRevision);
+    const plan = planReclaim({
+      bundles: previous.bundles,
+      scope,
+      versions: request.versions,
+      lineageKeys: this.#lineageKeys(previous),
+      historyKeys: this.#historyKeys(previous),
+      leasedKeys: this.#leasedKeys(),
+    });
+    if (plan.blocked.length > 0) {
+      throw new ApiError(
+        409,
+        "reclaim_blocked",
+        "Some requested versions are still referenced and cannot be reclaimed",
+      );
+    }
+
+    const bundles = new Map(previous.bundles);
+    for (const entry of plan.reclaimable) bundles.delete(entry.key);
+    const artifacts = new Map(previous.artifacts);
+    for (const digest of plan.freedDigests) artifacts.delete(digest);
+    const nextRevision = previous.revision + 1;
+    this.#state = {
+      ...previous,
+      revision: nextRevision,
+      bundles,
+      artifacts,
+    };
+    return {
+      ...scope,
+      revision: nextRevision,
+      operation: "reclaim",
+      reclaimedReleases: plan.reclaimable.length,
+      freedArtifacts: plan.freedDigests.length,
+    };
+  }
+
   snapshot() {
     return new RegistrySnapshot(this.#state);
   }
@@ -191,7 +289,41 @@ export class BundleRegistry {
       artifactCount: this.#state.artifacts.size,
       lineageCount: this.#state.lineage.size,
       historyDepth: this.#state.history.length,
+      activeLeases: this.#leases.size,
     };
+  }
+
+  // The set of bundle keys the live lineage graph currently references, as both
+  // a child and a parent — either role keeps a release's content reachable.
+  #lineageKeys(previous) {
+    const keys = new Set();
+    for (const [childKey, parentKey] of previous.lineage) {
+      keys.add(childKey);
+      keys.add(parentKey);
+    }
+    return keys;
+  }
+
+  // The set of bundle keys any retained rollback-history checkpoint references. A
+  // release named by the history window must survive so rollback can restore it.
+  #historyKeys(previous) {
+    const keys = new Set();
+    for (const entry of previous.history) {
+      for (const [childKey, parentKey] of entry.lineage) {
+        keys.add(childKey);
+        keys.add(parentKey);
+      }
+    }
+    return keys;
+  }
+
+  // The union of bundle keys pinned by every active batch read lease.
+  #leasedKeys() {
+    const keys = new Set();
+    for (const leased of this.#leases.values()) {
+      for (const key of leased) keys.add(key);
+    }
+    return keys;
   }
 
   #assertRevision(previous, expectedRevision) {

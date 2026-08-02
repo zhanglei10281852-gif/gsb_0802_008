@@ -67,6 +67,14 @@ export function createApiServer ({ registry, resolver, batchTimeoutMs = DEFAULT_
         send(response, 200, registry.applyLineage(await readJson(request)))
         return
       }
+      if (request.method === 'POST' && path === '/v1/reclaim/preview') {
+        send(response, 200, registry.previewReclaim(await readJson(request)))
+        return
+      }
+      if (request.method === 'POST' && path === '/v1/reclaim') {
+        send(response, 200, registry.reclaimBundles(await readJson(request)))
+        return
+      }
       if (request.method === 'POST' && path === '/v1/resolve/batch') {
         await resolveBatchRequest({ request, response, resolver, batchTimeoutMs })
         return

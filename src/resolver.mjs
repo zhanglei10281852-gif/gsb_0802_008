@@ -49,8 +49,11 @@ export class SymbolResolver {
     throwIfAborted(signal);
 
     // One snapshot pins the batch to a single revision so reuse can never mix
-    // old and new lineage, and later requests still observe newer revisions.
+    // old and new lineage, and later requests still observe newer revisions. A
+    // read lease taken at the same moment pins that revision's bundle content so
+    // reclamation cannot delete anything this batch may still read.
     const snapshot = this.registry.snapshot();
+    const lease = this.registry.acquireLease?.();
     const memo = new Map();
     const results = new Array(items.length);
     const workerCount = Math.min(Math.max(1, maxConcurrency), items.length);
@@ -104,9 +107,11 @@ export class SymbolResolver {
       if (cancelled || signal?.aborted) throwCancelled();
       return { registryRevision: snapshot.revision, results };
     } finally {
-      // Release the batch's read reuse table promptly whether we finished or
-      // were cancelled, so nothing pins the snapshot's read results.
+      // Release the batch's read reuse table and read lease promptly whether we
+      // finished or were cancelled, so nothing pins the snapshot's read results
+      // and reclamation can proceed once no batch still holds the content.
       memo.clear();
+      if (lease !== undefined) this.registry.releaseLease?.(lease);
     }
   }
 

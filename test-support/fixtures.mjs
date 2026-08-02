@@ -47,6 +47,15 @@ export function rollbackRequest (overrides = {}) {
   }
 }
 
+export function reclaimRequest (overrides = {}) {
+  return {
+    application: 'mobile-shell',
+    platform: 'android',
+    versions: ['2026.08.2'],
+    ...overrides
+  }
+}
+
 export function batchRequest (overrides = {}) {
   return {
     items: [resolveRequest()],

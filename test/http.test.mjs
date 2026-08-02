@@ -3,7 +3,7 @@ import test from 'node:test'
 import { BundleRegistry } from '../src/bundle-registry.mjs'
 import { createApiServer } from '../src/http.mjs'
 import { SymbolResolver } from '../src/resolver.mjs'
-import { bundle, batchRequest, lineageRequest, listen, resolveRequest, rollbackRequest } from '../test-support/fixtures.mjs'
+import { bundle, batchRequest, lineageRequest, listen, reclaimRequest, resolveRequest, rollbackRequest } from '../test-support/fixtures.mjs'
 
 async function startServer (t) {
   const registry = new BundleRegistry()
@@ -210,4 +210,48 @@ test('times out a batch that runs too long and releases the response', async (t)
   const response = await post(baseUrl, '/v1/resolve/batch', { items: [resolveRequest()] })
   assert.equal(response.status, 499)
   assert.equal((await response.json()).error, 'request_cancelled')
+})
+
+test('previews and applies reclamation over the HTTP boundary', async (t) => {
+  const { baseUrl } = await startServer(t)
+  await post(baseUrl, '/v1/bundles', bundle())
+  await post(baseUrl, '/v1/bundles', bundle({
+    version: '2026.08.2',
+    mappings: [{
+      generated: { file: 'hotfix.js', line: 1, column: 0 },
+      source: { file: 'src/hotfix.ts', line: 5, column: 2 }
+    }]
+  }))
+
+  const preview = await (await post(baseUrl, '/v1/reclaim/preview', reclaimRequest({ versions: ['2026.08.2'] }))).json()
+  assert.equal(preview.basedOnRevision, 2)
+  assert.deepEqual(preview.reclaimable.map((e) => e.version), ['2026.08.2'])
+  assert.equal(preview.freedArtifacts, 1)
+
+  const applied = await post(baseUrl, '/v1/reclaim', reclaimRequest({ versions: ['2026.08.2'], expectedRevision: preview.basedOnRevision }))
+  assert.equal(applied.status, 200)
+  const body = await applied.json()
+  assert.equal(body.operation, 'reclaim')
+  assert.equal(body.revision, 3)
+  assert.equal(body.reclaimedReleases, 1)
+
+  // The release is gone; resolving it now reports the standard not-found error.
+  const resolved = await post(baseUrl, '/v1/resolve', resolveRequest({ version: '2026.08.2' }))
+  assert.equal(resolved.status, 404)
+  assert.equal((await resolved.json()).error, 'bundle_not_found')
+})
+
+test('rejects reclamation that is blocked or based on a stale revision', async (t) => {
+  const { baseUrl } = await startServer(t)
+  await post(baseUrl, '/v1/bundles', bundle())
+  await post(baseUrl, '/v1/bundles', bundle({ version: '2026.08.2' }))
+  await post(baseUrl, '/v1/lineage', lineageRequest({ expectedRevision: 2 }))
+
+  const blocked = await post(baseUrl, '/v1/reclaim', reclaimRequest({ versions: ['2026.08.2'], expectedRevision: 3 }))
+  assert.equal(blocked.status, 409)
+  assert.equal((await blocked.json()).error, 'reclaim_blocked')
+
+  const stale = await post(baseUrl, '/v1/reclaim', reclaimRequest({ versions: ['2026.08.1'], expectedRevision: 1 }))
+  assert.equal(stale.status, 409)
+  assert.equal((await stale.json()).error, 'revision_conflict')
 })
