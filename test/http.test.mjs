@@ -232,3 +232,156 @@ test("rejects re-uploading an existing release with 409", async (t) => {
   assert.equal(response.status, 409);
   assert.equal((await response.json()).error, "bundle_already_exists");
 });
+
+test("previews lineage impact over HTTP without applying", async (t) => {
+  const registry = new BundleRegistry();
+  const server = createApiServer({
+    registry,
+    resolver: new SymbolResolver(registry),
+  });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await jsonPost(`${baseUrl}/v1/bundles`, bundle({ version: "2026.08.1" }));
+  await jsonPost(
+    `${baseUrl}/v1/bundles`,
+    bundle({
+      version: "2026.08.2",
+      mappings: [
+        {
+          generated: { file: "new.js", line: 1, column: 0 },
+          source: { file: "src/new.ts", line: 1, column: 0 },
+        },
+      ],
+    }),
+  );
+
+  const preview = await jsonPost(`${baseUrl}/v1/lineage/preview`, {
+    expectedRevision: 2,
+    relationships: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.2",
+        parentVersion: "2026.08.1",
+      },
+    ],
+  });
+  assert.equal(preview.status, 200);
+  const body = await preview.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.baseRevision, 2);
+  assert.equal(body.nextRevision, 3);
+  assert.equal(body.changes[0].fromVersion, null);
+  assert.equal(body.changes[0].toVersion, "2026.08.1");
+  assert.ok(body.affectedReleases.some((r) => r.version === "2026.08.2"));
+
+  const rejected = await jsonPost(`${baseUrl}/v1/lineage/preview`, {
+    expectedRevision: 2,
+    relationships: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.2",
+        parentVersion: "9.9.9",
+      },
+    ],
+  });
+  assert.equal(rejected.status, 200);
+  const rejectedBody = await rejected.json();
+  assert.equal(rejectedBody.ok, false);
+  assert.equal(rejectedBody.rejection.code, "unknown_version");
+});
+
+test("lists lineage history and rolls back over HTTP as a new revision", async (t) => {
+  const registry = new BundleRegistry();
+  const server = createApiServer({
+    registry,
+    resolver: new SymbolResolver(registry),
+  });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await jsonPost(`${baseUrl}/v1/bundles`, bundle({ version: "2026.08.1" }));
+  await jsonPost(
+    `${baseUrl}/v1/bundles`,
+    bundle({
+      version: "2026.08.2",
+      parentVersion: "2026.08.1",
+      mappings: [
+        {
+          generated: { file: "new.js", line: 1, column: 0 },
+          source: { file: "src/new.ts", line: 1, column: 0 },
+        },
+      ],
+    }),
+  );
+  await jsonPost(`${baseUrl}/v1/lineage`, {
+    expectedRevision: 2,
+    relationships: [
+      {
+        application: "mobile-shell",
+        platform: "android",
+        version: "2026.08.2",
+        parentVersion: null,
+      },
+    ],
+  });
+
+  const historyRes = await fetch(`${baseUrl}/v1/lineage/history`);
+  assert.equal(historyRes.status, 200);
+  const history = await historyRes.json();
+  assert.equal(history.revision, 3);
+  assert.ok(history.entries.some((e) => e.kind === "publish"));
+  assert.ok(history.entries.some((e) => e.kind === "adjustment"));
+
+  const rollback = await jsonPost(`${baseUrl}/v1/lineage/rollback`, {
+    expectedRevision: 3,
+    targetRevision: 2,
+  });
+  assert.equal(rollback.status, 200);
+  const rolled = await rollback.json();
+  assert.equal(rolled.revision, 4);
+  assert.equal(rolled.targetRevision, 2);
+  assert.equal(rolled.changes[0].toVersion, "2026.08.1");
+
+  const resolved = await jsonPost(`${baseUrl}/v1/resolve`, {
+    application: "mobile-shell",
+    platform: "android",
+    version: "2026.08.2",
+    frames: [{ file: "app.js", line: 10, column: 2 }],
+  });
+  assert.equal((await resolved.json()).frames[0].status, "ancestor");
+});
+
+test("rollback rejects stale revision with 412", async (t) => {
+  const registry = new BundleRegistry();
+  const server = createApiServer({
+    registry,
+    resolver: new SymbolResolver(registry),
+  });
+  const baseUrl = await listen(server);
+  t.after(() => server.close());
+
+  await jsonPost(`${baseUrl}/v1/bundles`, bundle({ version: "2026.08.1" }));
+  await jsonPost(
+    `${baseUrl}/v1/bundles`,
+    bundle({
+      version: "2026.08.2",
+      parentVersion: "2026.08.1",
+      mappings: [
+        {
+          generated: { file: "new.js", line: 1, column: 0 },
+          source: { file: "src/new.ts", line: 1, column: 0 },
+        },
+      ],
+    }),
+  );
+
+  const response = await jsonPost(`${baseUrl}/v1/lineage/rollback`, {
+    expectedRevision: 99,
+    targetRevision: 1,
+  });
+  assert.equal(response.status, 412);
+  assert.equal((await response.json()).error, "revision_mismatch");
+});

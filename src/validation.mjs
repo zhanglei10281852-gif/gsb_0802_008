@@ -91,6 +91,22 @@ export function readBatchBody (value) {
   return value.requests
 }
 
+export function readRollbackBody (value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ApiError(400, 'invalid_payload', 'Request body must be an object')
+  }
+  if (!Number.isInteger(value.expectedRevision) || value.expectedRevision < 0) {
+    throw new ApiError(400, 'invalid_expected_revision', 'expectedRevision must be a non-negative integer')
+  }
+  if (!Number.isInteger(value.targetRevision) || value.targetRevision < 0) {
+    throw new ApiError(400, 'invalid_target_revision', 'targetRevision must be a non-negative integer')
+  }
+  if (value.targetRevision > value.expectedRevision) {
+    throw new ApiError(400, 'invalid_target_revision', 'targetRevision cannot be newer than expectedRevision')
+  }
+  return { expectedRevision: value.expectedRevision, targetRevision: value.targetRevision }
+}
+
 export function readMappings (value) {
   if (!Array.isArray(value) || value.length === 0) {
     throw new ApiError(400, 'invalid_mappings', 'mappings must be a non-empty array')
