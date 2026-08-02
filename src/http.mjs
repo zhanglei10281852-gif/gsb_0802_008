@@ -32,6 +32,14 @@ export function createApiServer ({ registry, resolver }) {
         send(response, 201, registry.put(await readJson(request)))
         return
       }
+      if (request.method === 'POST' && path === '/v1/lineage') {
+        send(response, 200, registry.applyLineage(await readJson(request)))
+        return
+      }
+      if (request.method === 'POST' && path === '/v1/resolve/batch') {
+        send(response, 200, resolver.resolveBatch(await readJson(request)))
+        return
+      }
       if (request.method === 'POST' && path === '/v1/resolve') {
         send(response, 200, resolver.resolve(await readJson(request)))
         return
